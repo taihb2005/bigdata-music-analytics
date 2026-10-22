@@ -1,0 +1,14 @@
+save 900 1    
+save 300 10      
+save 60 10000  
+
+dir /data
+
+protected-mode no
+bind 0.0.0.0
+port 6379
+requirepass <your_super_secret_password>
+
+appendonly no
+
+maxmemory-policy noeviction
