@@ -1,0 +1,18 @@
+networks:
+  bigdata-common-net:
+    name: bigdata-common-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+
+  batch-net:
+    name: batch-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.30.10.0/24
+          gateway: 172.30.10.1
