@@ -15,7 +15,7 @@ flowchart TD
 
     D --> E[Spark Structured Streaming<br/>micro-batch mỗi 10 giây]
     E --> F[Phân tích và kiểm tra event]
-    F --> G[Watermark và chống trùng event_id]
+    F --> G[Kiểm tra event_id và đánh dấu event đến trễ]
 
     G --> H[(HBase<br/>music_scrobble_events)]
     G --> I[(Redis<br/>thống kê realtime)]
@@ -52,9 +52,11 @@ Last.fm Recent Tracks
        └─ Kafka: metadata.request nếu thiếu metadata
 ```
 
-Spark sử dụng event time, watermark và `event_id` để xử lý event đến muộn và
-tránh ghi trùng. Redis phục vụ kết quả đang được truy vấn thường xuyên, còn
-HBase lưu event lâu dài.
+Spark không loại event chỉ vì thời điểm nghe đã cũ. Mọi scrobble hợp lệ được
+ghi idempotent vào HBase; Redis dùng `event_id` để tránh tăng thống kê nhiều
+lần. Event đến trễ hơn ngưỡng cấu hình vẫn được xử lý và được lưu thêm trong
+`music_late_events` để kiểm tra. Redis phục vụ kết quả đang được truy vấn
+thường xuyên, còn HBase lưu event lâu dài.
 
 ## Luồng bổ sung metadata
 

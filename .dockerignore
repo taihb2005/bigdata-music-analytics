@@ -1,0 +1,8 @@
+.git
+.env
+**/__pycache__
+*.pyc
+dataset/LastFM User Charts.xlsx
+dataset/raw
+dataset/state
+redis/redis.conf

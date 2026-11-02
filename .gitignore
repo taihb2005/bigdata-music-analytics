@@ -1,2 +1,6 @@
 .env
 redis/redis.conf
+__pycache__/
+*.py[cod]
+dataset/raw/
+dataset/state/

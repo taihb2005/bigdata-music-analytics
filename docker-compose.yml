@@ -27,12 +27,13 @@ services:
       - inter-net
 
   minio:
+    profiles: ["batch"]
     image: taihb2005/minio:1.0.0
     container_name: datalake
     hostname: minio
     ports:
-      - "9000:9000"     # S3 API Port
-      - "9001:9001"     # MinIO Web Console
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
@@ -56,10 +57,156 @@ services:
       - data-net
       - inter-net
 
+  hbase:
+    image: harisekhon/hbase:2.1
+    container_name: hbase
+    hostname: hbase
+    restart: unless-stopped
+    ports:
+      - "16010:16010"
+      - "9090:9090"
+      - "8080:8080"
+    volumes:
+      - hbase_data:/hbase-data
+    networks:
+      - data-net
+
+  stream-init:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: stream_init
+    command:
+      - python
+      - stream/bootstrap/init_stream_resources.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+    volumes:
+      - ./redis/redis.conf:/app/redis/redis.conf:ro
+    depends_on:
+      - kafka
+      - hbase
+    networks:
+      - data-net
+    restart: "no"
+
+  scrobble-producer:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: scrobble_producer
+    command:
+      - python
+      - stream/producer/produce_scrobbles.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --poll-seconds
+      - "60"
+      - --limit
+      - "50"
+    env_file:
+      - .env
+    volumes:
+      - ./dataset/state:/app/dataset/state
+    depends_on:
+      kafka:
+        condition: service_started
+      stream-init:
+        condition: service_completed_successfully
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  spark-speed-layer:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    container_name: spark_speed_layer
+    environment:
+      PYTHONPATH: /opt/app
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.executorEnv.PYTHONPATH=/opt/app
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0
+      - /opt/app/stream/processing/spark_speed_layer.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --starting-offsets
+      - earliest
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/0
+      - --checkpoint
+      - /opt/app/dataset/state/spark-speed-layer-v2
+    volumes:
+      - ./:/opt/app
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  metadata-worker:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: metadata_worker
+    command:
+      - python
+      - stream/metadata/metadata_worker.py
+      - --bootstrap-servers
+      - kafka:9094
+    env_file:
+      - .env
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+    networks:
+      - data-net
+    restart: unless-stopped
+
+  metadata-sink:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: metadata_sink
+    command:
+      - python
+      - stream/metadata/metadata_sink.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/0
+    volumes:
+      - ./redis/redis.conf:/app/redis/redis.conf:ro
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    networks:
+      - data-net
+    restart: unless-stopped
+
 volumes:
   kafka_data:
   redis_data:
   minio_data:
+  hbase_data:
  
 networks:
   data-net:

@@ -1,5 +1,3 @@
-"""Extract the top users from a leaderboard sheet into a JSON input file."""
-
 from __future__ import annotations
 
 import argparse
