@@ -6,12 +6,15 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from stream.common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen
+from stream.common.ids import user_key
 from stream.common.metadata_common import build_metadata_requests
 
 
 TABLE_FAMILIES: dict[str, dict[str, dict[str, Any]]] = {
     "music_user_profile": {"profile": {}, "stats": {}, "control": {}},
     "music_scrobble_events": {"event": {}, "ref": {}, "control": {}},
+    "fact_listen": {"d": {}},
     "music_track_metadata": {"info": {}, "stats": {}, "tags": {}, "wiki": {}, "control": {}},
     "music_artist_metadata": {"info": {}, "stats": {}, "similar": {}, "tags": {}, "bio": {}, "control": {}},
     "music_album_metadata": {"info": {}, "stats": {}, "tracks": {}, "wiki": {}, "control": {}},
@@ -38,9 +41,43 @@ def _salt(username: str) -> str:
     return hashlib.sha256(username.casefold().encode("utf-8")).hexdigest()[:2]
 
 
+def _user_prefix(username: str) -> str:
+    """Tiền tố row key theo user: salt#user#, user không phân biệt hoa thường (khớp fact_listen.user_id)."""
+    key = user_key(username)
+    return f"{_salt(key)}#{key}#"
+
+
+def event_row_key(event: dict[str, Any]) -> str:
+    """Row key của event: salt#user#đảo-thời-gian#event_id (mới nhất trước, ghi lại là idempotent)."""
+    date = (event.get("scrobble_event", {}) or {}).get("date", {}) or {}
+    uts = int(str(date.get("uts", "0")) or "0")
+    reverse_timestamp = 9_999_999_999_999 - (uts * 1000)
+    return f"{_user_prefix(str(event.get('user', '')))}{reverse_timestamp:013d}#{event['event_id']}"
+
+
+LONG_TEXT_COLUMNS = {"wiki:data", "bio:data", "tracks:data"}
+
+
 class HBaseStore:
-    def __init__(self, host: str | None = None, port: int | None = None) -> None:
-        """Mở kết nối HBase Thrift theo cấu hình được cung cấp."""
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        *,
+        connection: Any = None,
+        store_long_text: bool = False,
+        keep_realname: bool = False,
+    ) -> None:
+        """Mở kết nối HBase Thrift (hoặc dùng connection truyền vào, tiện cho test).
+
+        store_long_text=False: bỏ wiki, bio và danh sách bài của album (văn bản dài, tốn dung lượng
+        và chịu giới hạn lưu trữ của điều khoản Last.fm). keep_realname=False: không lưu tên thật.
+        """
+        self.store_long_text = store_long_text
+        self.keep_realname = keep_realname
+        if connection is not None:
+            self.connection = connection
+            return
         try:
             import happybase
         except ImportError as exc:
@@ -88,10 +125,8 @@ class HBaseStore:
         artist = scrobble.get("artist", {}) or {}
         album = scrobble.get("album", {}) or {}
         username = str(event.get("user", ""))
-        uts = int(str(date.get("uts", "0")) or "0")
-        reverse_timestamp = 9_999_999_999_999 - (uts * 1000)
         refs = {request["entity_type"]: request["entity_id"] for request in build_metadata_requests(event)}
-        row_key = f"{_salt(username)}#{username}#{reverse_timestamp:013d}#{event['event_id']}"
+        row_key = event_row_key(event)
         self._put(
             "music_scrobble_events",
             row_key,
@@ -121,6 +156,33 @@ class HBaseStore:
         )
         return refs
 
+    def put_fact_listen(self, event: dict[str, Any], tags: list[str] | None = None,
+                        tag_source: str | None = None, duration_ms: Any = None) -> None:
+        """Ghi dòng phẳng fact_listen (cùng tên trường với batch). Bỏ qua event thiếu dữ liệu."""
+        try:
+            fact = to_fact_listen(event, tags=tags, tag_source=tag_source, duration_ms=duration_ms)
+        except ValueError:
+            return
+        self._put("fact_listen", event_row_key(event),
+                  {f"d:{name}": fact[name] for name in FACT_LISTEN_FIELDS})
+
+    def recent_events(self, username: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Các scrobble mới nhất của một user (đọc từ HBase, mới nhất trước)."""
+        prefix = _user_prefix(username).encode("utf-8")
+        rows = self.connection.table("music_scrobble_events").scan(row_prefix=prefix, limit=limit)
+        events = []
+        for _key, row in rows:
+            decoded = {column.decode("utf-8"): value.decode("utf-8") for column, value in row.items()}
+            events.append({
+                "event_id": decoded.get("event:event_id", ""),
+                "played_at": decoded.get("event:played_at", ""),
+                "track": decoded.get("event:track_name", ""),
+                "artist": decoded.get("event:artist_name", ""),
+                "album": decoded.get("event:album_name", ""),
+                "loved": decoded.get("event:loved", "0") == "1",
+            })
+        return events
+
     def metadata_available(self, request: dict[str, Any]) -> bool:
         """Kiểm tra metadata chung và thống kê riêng theo user đã tồn tại."""
         return self._metadata_status(request) == "available"
@@ -135,11 +197,13 @@ class HBaseStore:
         entity_id = request["entity_id"]
         username = request["username"]
         if entity_type == "user":
-            row = self.connection.table("music_user_profile").row(username.encode("utf-8"))
+            row = self.connection.table("music_user_profile").row(user_key(username).encode("utf-8"))
             return row.get(b"control:status", b"").decode("utf-8")
         global_table = f"music_{entity_type}_metadata"
         global_row = self.connection.table(global_table).row(entity_id.encode("utf-8"))
-        stats_key = f"{_salt(username)}#{username}#{entity_id}".encode("utf-8")
+        if not username:  # yêu cầu dùng chung: không có thống kê theo user
+            return global_row.get(b"control:status", b"").decode("utf-8")
+        stats_key = f"{_user_prefix(username)}{entity_id}".encode("utf-8")
         stats_row = self.connection.table(f"music_user_{entity_type}_stats").row(stats_key)
         global_status = global_row.get(b"control:status", b"").decode("utf-8")
         stats_status = stats_row.get(b"control:status", b"").decode("utf-8")
@@ -171,11 +235,11 @@ class HBaseStore:
         if entity_type == "user":
             self._put(
                 "music_user_profile",
-                username,
+                user_key(username),
                 {
                     "profile:id": metadata.get("id"),
                     "profile:name": metadata.get("name"),
-                    "profile:realname": metadata.get("realname"),
+                    "profile:realname": metadata.get("realname") if self.keep_realname else "",
                     "profile:country": metadata.get("country"),
                     "profile:registered": metadata.get("registered", {}),
                     "stats:playcount": metadata.get("playcount"),
@@ -225,14 +289,19 @@ class HBaseStore:
                     "wiki:data": metadata.get("wiki", {}),
                 }
             )
+        if not self.store_long_text:
+            common = {column: value for column, value in common.items() if column not in LONG_TEXT_COLUMNS}
         self._put(f"music_{entity_type}_metadata", entity_id, common)
+
+        if not username:  # metadata dùng chung: không có userplaycount để ghi
+            return
 
         userplaycount = (
             metadata.get("stats", {}).get("userplaycount", "0")
             if entity_type == "artist"
             else metadata.get("userplaycount", "0")
         )
-        stats_key = f"{_salt(username)}#{username}#{entity_id}"
+        stats_key = f"{_user_prefix(username)}{entity_id}"
         self._put(
             f"music_user_{entity_type}_stats",
             stats_key,
@@ -243,6 +312,22 @@ class HBaseStore:
                 "control:updated_at": fetched_at,
             },
         )
+
+    def mark_metadata_failed(self, request: dict[str, Any], failed_at: str) -> None:
+        """Đánh dấu metadata thất bại ngay trên bảng metadata (không đè dữ liệu đã có nếu từng thành công)."""
+        entity_type = request.get("entity_type")
+        if entity_type not in {"user", "track", "artist", "album"}:
+            return
+        if entity_type == "user":
+            table, row_key = "music_user_profile", user_key(request.get("username", ""))
+        else:
+            table, row_key = f"music_{entity_type}_metadata", str(request.get("entity_id", ""))
+        if not row_key:
+            return
+        current = self.connection.table(table).row(row_key.encode("utf-8"), columns=[b"control:status"])
+        if current.get(b"control:status") in {b"available", b"not_found"}:
+            return
+        self._put(table, row_key, {"control:status": "failed", "control:updated_at": failed_at})
 
     def put_metadata_failure(self, result: dict[str, Any]) -> None:
         """Lưu yêu cầu metadata thất bại để theo dõi hoặc xử lý lại."""
@@ -266,8 +351,7 @@ class HBaseStore:
 
     def put_late_event(self, event: dict[str, Any], delay_seconds: int) -> None:
         """Lưu bản sao event đến trễ để kiểm tra nhưng không loại khỏi xử lý."""
-        username = str(event.get("user", ""))
-        row_key = f"{_salt(username)}#{username}#{event.get('event_id', '')}"
+        row_key = f"{_user_prefix(str(event.get('user', '')))}{event.get('event_id', '')}"
         self._put(
             "music_late_events",
             row_key,
@@ -287,12 +371,12 @@ class HBaseStore:
         daily_summary: dict[str, Any],
     ) -> None:
         """Lưu snapshot thống kê Redis hiện tại của user theo ngày."""
-        row_key = f"{_salt(username)}#{username}#{day}"
+        row_key = f"{_user_prefix(username)}{day}"
         self._put(
             "music_user_metrics_realtime",
             row_key,
             {
-                "window:username": username,
+                "window:username": user_key(username),
                 "window:day": day,
                 "metric:summary": summary,
                 "metric:daily_summary": daily_summary,

@@ -4,3 +4,5 @@ __pycache__/
 *.py[cod]
 dataset/raw/
 dataset/state/
+dataset/sample/
+.vscode/

@@ -1,29 +1,30 @@
+"""Speed layer: Kafka (scrobble.raw) -> Spark Structured Streaming -> HBase (serving) + Redis (trạng thái nóng).
+
+Spark chỉ đọc Kafka theo micro-batch rồi gọi stream.processing.pipeline.process_events cho từng
+partition. KHÔNG có watermark hay cửa sổ stateful của Spark: khử trùng làm bằng Redis (SET NX), còn
+các cửa sổ 5 phút/1 giờ theo thời gian sự kiện được cộng dồn trong Redis (xem realtime_store).
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stream.common.lastfm_client import load_dotenv
-from stream.common.metadata_common import (
-    build_metadata_requests,
-    encode_message,
-    metadata_cache_key,
+from stream.common.metadata_common import encode_message
+from stream.processing.pipeline import (  # noqa: F401  (re-export cho test và công cụ khác)
+    PipelineConfig,
+    cached_track_duration,
+    event_delay_seconds,
+    process_events,
 )
-from stream.processing.realtime_store import (
-    UPDATE_LUA,
-    analytics_values,
-    duration_pending_key,
-    redis_keys,
-)
+from stream.processing.realtime_store import APPLY_DURATION_LUA, UPDATE_LUA
 from stream.storage.hbase_store import HBaseStore
 from stream.storage.redis_utils import redis_password
 
@@ -38,47 +39,86 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topic", default="scrobble.raw")
     parser.add_argument("--metadata-request-topic", default="metadata.request")
     parser.add_argument("--starting-offsets", choices=["earliest", "latest"], default="earliest")
-    parser.add_argument("--late-after-seconds", type=int, default=600)
+    parser.add_argument("--max-offsets-per-trigger", type=int, default=2000)
+    parser.add_argument("--late-after-seconds", type=int, default=1800)
     parser.add_argument("--trigger", default="10 seconds")
     parser.add_argument(
         "--checkpoint",
-        default=str(PROJECT_ROOT / "dataset" / "state" / "spark-speed-layer-v2"),
+        default=str(PROJECT_ROOT / "dataset" / "state" / "spark-speed-layer-v4"),
     )
     parser.add_argument("--hbase-host", default=os.getenv("HBASE_HOST", "localhost"))
     parser.add_argument("--hbase-port", type=int, default=int(os.getenv("HBASE_THRIFT_PORT", "9090")))
     parser.add_argument("--redis-url", default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     parser.add_argument("--recent-limit", type=int, default=50)
-    parser.add_argument("--dedupe-days", type=int, default=0)
+    parser.add_argument("--dedupe-days", type=int, default=7, help="TTL khóa khử trùng (ngày)")
+    parser.add_argument("--daily-ttl-days", type=int, default=30, help="TTL thống kê theo ngày (ngày)")
+    parser.add_argument("--user-ttl-days", type=int, default=90,
+                        help="TTL thống kê toàn thời gian của user, gia hạn mỗi lần user nghe (ngày)")
+    parser.add_argument("--metadata-sources", default="lastfm",
+                        help="Chỉ yêu cầu metadata cho event có source thuộc danh sách này (phẩy); rỗng = mọi nguồn")
     parser.add_argument("--metadata-lock-ttl", type=int, default=86400)
+    parser.add_argument(
+        "--per-user-stats",
+        action="store_true",
+        help="Gọi getInfo kèm username để lấy userplaycount (mỗi cặp user x mục một request, rất tốn)",
+    )
+    parser.add_argument("--no-global-windows", action="store_true")
+    parser.add_argument("--allow-offset-regression", action="store_true",
+                        help="Bỏ qua kiểm tra checkpoint đi trước Kafka (chỉ dùng khi biết chắc mình đang làm gì)")
     return parser.parse_args()
 
 
-def event_delay_seconds(event: dict[str, Any]) -> int:
-    """Tính độ trễ giữa lúc nghe và lúc producer tiếp nhận event."""
+def checkpoint_offsets(checkpoint: str | Path, topic: str) -> dict[int, int] | None:
+    """Offset Kafka đã ghi trong batch mới nhất của checkpoint Spark (None nếu chưa có checkpoint)."""
+    offsets_dir = Path(checkpoint) / "offsets"
+    if not offsets_dir.is_dir():
+        return None
+    batches = sorted((int(p.name) for p in offsets_dir.iterdir() if p.name.isdigit()), reverse=True)
+    for batch in batches:
+        lines = (offsets_dir / str(batch)).read_text(encoding="utf-8").splitlines()
+        for line in lines[2:]:  # dòng 1 là "v1", dòng 2 là metadata, sau đó là offset của từng nguồn
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and topic in value:
+                return {int(partition): int(offset) for partition, offset in value[topic].items()}
+    return None
+
+
+def find_offset_regressions(saved: dict[int, int], end_offsets: dict[int, int]) -> list[tuple[int, int, int]]:
+    """Các partition mà checkpoint đi TRƯỚC offset cuối của Kafka: (partition, checkpoint, kafka).
+
+    Chỉ xảy ra khi topic bị tạo lại (mất dữ liệu Kafka). Khi đó Spark sẽ coi các message mới có offset
+    nhỏ hơn checkpoint là đã xử lý và BỎ QUA chúng mà không báo lỗi.
+    """
+    return [
+        (partition, offset, end_offsets.get(partition, 0))
+        for partition, offset in sorted(saved.items())
+        if offset > end_offsets.get(partition, 0)
+    ]
+
+
+def guard_checkpoint(args) -> None:
+    """Dừng nếu checkpoint không khớp topic hiện tại, thay vì lặng lẽ bỏ qua message."""
+    saved = checkpoint_offsets(args.checkpoint, args.topic)
+    if not saved or args.allow_offset_regression:
+        return
+    from kafka import KafkaConsumer, TopicPartition
+
+    consumer = KafkaConsumer(bootstrap_servers=args.bootstrap_servers)
     try:
-        played_at = int(event["scrobble_event"]["date"]["uts"])
-        ingested_at = datetime.fromisoformat(
-            str(event["ingested_at"]).replace("Z", "+00:00")
+        partitions = [TopicPartition(args.topic, p) for p in (consumer.partitions_for_topic(args.topic) or [])]
+        end = {tp.partition: offset for tp, offset in consumer.end_offsets(partitions).items()}
+    finally:
+        consumer.close()
+    regressions = find_offset_regressions(saved, end)
+    if regressions:
+        detail = ", ".join(f"p{p}: checkpoint {c} > kafka {k}" for p, c, k in regressions)
+        raise SystemExit(
+            f"Checkpoint {args.checkpoint} đi trước topic {args.topic} ({detail}). Topic đã bị tạo lại nên "
+            "Spark sẽ bỏ qua message mới. Dùng --checkpoint mới (hoặc đổi tên thư mục checkpoint cũ) rồi chạy lại."
         )
-        if ingested_at.tzinfo is None:
-            ingested_at = ingested_at.replace(tzinfo=timezone.utc)
-        return max(0, int(ingested_at.timestamp()) - played_at)
-    except (KeyError, TypeError, ValueError, OSError):
-        return 0
-
-
-def cached_track_duration(value: str | None) -> str | None:
-    """Đọc duration từ kết quả metadata đã cache nếu trạng thái khả dụng."""
-    if not value:
-        return None
-    try:
-        result = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    if result.get("status") != "available":
-        return None
-    duration = str(result.get("metadata", {}).get("duration", "0"))
-    return duration if duration.isdigit() else "0"
 
 
 def main() -> None:
@@ -86,7 +126,7 @@ def main() -> None:
     args = parse_args()
     from kafka import KafkaProducer
     from pyspark.sql import SparkSession
-    from pyspark.sql.functions import col, from_json, from_unixtime, to_timestamp
+    from pyspark.sql.functions import col, from_json
     from pyspark.sql.types import (
         ArrayType,
         BooleanType,
@@ -96,6 +136,26 @@ def main() -> None:
         StructType,
     )
     from redis import Redis
+
+    cfg = PipelineConfig(
+        late_after_seconds=args.late_after_seconds,
+        recent_limit=args.recent_limit,
+        dedupe_days=args.dedupe_days,
+        daily_ttl_days=args.daily_ttl_days,
+        user_ttl_days=args.user_ttl_days,
+        metadata_sources=tuple(part.strip() for part in args.metadata_sources.split(",") if part.strip()),
+        metadata_lock_ttl=args.metadata_lock_ttl,
+        metadata_request_topic=args.metadata_request_topic,
+        per_user_stats=args.per_user_stats,
+        global_windows=not args.no_global_windows,
+    )
+
+    guard_checkpoint(args)
+
+    # Tạo bảng HBase đúng một lần khi khởi động (không làm lại ở mỗi micro-batch).
+    bootstrap_store = HBaseStore(args.hbase_host, args.hbase_port)
+    bootstrap_store.ensure_tables()
+    bootstrap_store.close()
 
     named_entity = StructType(
         [StructField("name", StringType()), StructField("mbid", StringType())]
@@ -134,14 +194,16 @@ def main() -> None:
 
     spark = SparkSession.builder.appName("lastfm-speed-layer").getOrCreate()
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    kafka = (
+    reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
         .option("subscribe", args.topic)
         .option("startingOffsets", args.starting_offsets)
         .option("failOnDataLoss", "true")
-        .load()
     )
+    if args.max_offsets_per_trigger > 0:
+        reader = reader.option("maxOffsetsPerTrigger", args.max_offsets_per_trigger)
+    kafka = reader.load()
     parsed = (
         kafka.select(
             from_json(col("value").cast("string"), event_schema).alias("event"),
@@ -154,21 +216,14 @@ def main() -> None:
             & (col("user").isNotNull())
             & (col("event_type") == "scrobble")
             & (col("scrobble_event.date.uts") != "")
+            & col("scrobble_event.date.uts").cast("long").isNotNull()
         )
-        .withColumn(
-            "event_time",
-            to_timestamp(from_unixtime(col("scrobble_event.date.uts").cast("long"))),
-        )
-        .filter(col("event_time").isNotNull())
     )
 
     def process_batch(batch_df, batch_id: int) -> None:
         """Ghi một micro-batch vào HBase/Redis và yêu cầu metadata còn thiếu."""
         if batch_df.isEmpty():
             return
-        bootstrap_store = HBaseStore(args.hbase_host, args.hbase_port)
-        bootstrap_store.ensure_tables()
-        bootstrap_store.close()
 
         def process_partition(rows) -> None:
             store = HBaseStore(args.hbase_host, args.hbase_port)
@@ -176,119 +231,34 @@ def main() -> None:
                 args.redis_url, password=redis_password(), decode_responses=True
             )
             update_realtime = redis_client.register_script(UPDATE_LUA)
-            producer = KafkaProducer(
-                bootstrap_servers=args.bootstrap_servers,
-                acks="all",
-                key_serializer=lambda value: value.encode("utf-8"),
-                value_serializer=encode_message,
-            )
+            apply_duration = redis_client.register_script(APPLY_DURATION_LUA)
+
+            def producer_factory():
+                return KafkaProducer(
+                    bootstrap_servers=args.bootstrap_servers,
+                    acks="all",
+                    key_serializer=lambda value: value.encode("utf-8"),
+                    value_serializer=encode_message,
+                )
+
             try:
-                for row in rows:
-                    event = row.asDict(recursive=True)
-                    event.pop("event_time", None)
-                    store.put_scrobble_event(event)
-
-                    delay_seconds = event_delay_seconds(event)
-                    if delay_seconds > args.late_after_seconds:
-                        store.put_late_event(event, delay_seconds)
-
-                    requests = build_metadata_requests(event)
-                    missing_requests = []
-                    track_request = None
-                    track_duration = None
-                    track_is_pending = False
-                    for request in requests:
-                        cached = redis_client.get(metadata_cache_key(request))
-                        if cached is not None:
-                            if request["entity_type"] == "track":
-                                track_request = request
-                                track_duration = cached_track_duration(cached)
-                            continue
-                        if store.metadata_resolved(request):
-                            if request["entity_type"] == "track":
-                                track_request = request
-                                track_duration = store.track_duration(request)
-                            continue
-                        missing_requests.append(request)
-                        if request["entity_type"] == "track":
-                            track_request = request
-                            track_is_pending = True
-
-                    values = analytics_values(event, duration_ms=track_duration)
-                    recent = json.dumps(
-                        {
-                            "event_id": values["event_id"],
-                            "played_at": values["played_at"],
-                            "track": values["track"],
-                            "artist": values["artist"],
-                            "album": values["album"],
-                            "loved": values["loved"] == "1",
-                            "duration_ms": int(values["duration_ms"]),
-                        },
-                        ensure_ascii=False,
-                    )
-                    keys = redis_keys(
-                        values["username"], values["event_id"], values["day"]
-                    )
-                    updated = update_realtime(
-                        keys=keys,
-                        args=[
-                            str(args.dedupe_days * 86400),
-                            values["loved"],
-                            values["duration_ms"],
-                            values["event_id"],
-                            values["played_at"],
-                            values["track"],
-                            values["artist"],
-                            values["album"],
-                            values["played_at"],
-                            recent,
-                            str(args.recent_limit),
-                        ],
-                    )
-
-                    if updated and track_request is not None and track_is_pending:
-                        pending = json.dumps(
-                            {
-                                "username": values["username"],
-                                "event_id": values["event_id"],
-                                "day": values["day"],
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        )
-                        pending_key = duration_pending_key(track_request["request_id"])
-                        pipeline = redis_client.pipeline()
-                        pipeline.rpush(pending_key, pending)
-                        pipeline.expire(pending_key, 7 * 86400)
-                        pipeline.execute()
-
-                    if updated:
-                        store.put_user_metrics_realtime(
-                            values["username"],
-                            values["day"],
-                            redis_client.hgetall(keys[1]),
-                            redis_client.hgetall(keys[6]),
-                        )
-
-                    for request in missing_requests:
-                        lock_key = f"lock:metadata:request:{request['request_id']}"
-                        if redis_client.set(
-                            lock_key, "1", nx=True, ex=args.metadata_lock_ttl
-                        ):
-                            producer.send(
-                                args.metadata_request_topic,
-                                key=request["request_id"],
-                                value=request,
-                            )
-                producer.flush(timeout=30)
+                stats = process_events(
+                    (row.asDict(recursive=True) for row in rows),
+                    store,
+                    redis_client,
+                    update_realtime,
+                    producer_factory,
+                    cfg,
+                    apply_duration=apply_duration,
+                )
+                if stats:
+                    print(f"batch {batch_id}: {stats}", flush=True)
             finally:
-                producer.close(timeout=10)
                 redis_client.close()
                 store.close()
 
         batch_df.foreachPartition(process_partition)
-        print(f"Spark micro-batch {batch_id} committed")
+        print(f"Spark micro-batch {batch_id} committed", flush=True)
 
     query = (
         parsed.writeStream.foreachBatch(process_batch)

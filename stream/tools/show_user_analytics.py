@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from stream.common.lastfm_client import load_dotenv
+from stream.storage.redis_reader import read_user_analytics
 from stream.storage.redis_utils import redis_password
 
 
@@ -40,15 +41,9 @@ def main() -> None:
         password=redis_password(),
         decode_responses=True,
     )
-    base = f"analytics:user:{args.username}"
-    output = {
-        "username": args.username,
-        "summary": client.hgetall(f"{base}:summary"),
-        "top_tracks": client.zrevrange(f"{base}:tracks", 0, args.top - 1, withscores=True),
-        "top_artists": client.zrevrange(f"{base}:artists", 0, args.top - 1, withscores=True),
-        "top_albums": client.zrevrange(f"{base}:albums", 0, args.top - 1, withscores=True),
-        "recent": [json.loads(value) for value in client.lrange(f"{base}:recent", 0, args.recent - 1)],
-    }
+    output = read_user_analytics(client, args.username, top=args.top, recent=args.recent)
+    if output is None:
+        raise SystemExit(f"Chưa có dữ liệu cho user {args.username}")
     print(json.dumps(output, ensure_ascii=False, indent=2))
     client.close()
 

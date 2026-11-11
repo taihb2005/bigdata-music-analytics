@@ -1,148 +1,69 @@
-# Luồng xử lý nghe nhạc gần thời gian thực
-
-Hệ thống thu thập dữ liệu nghe nhạc từ Last.fm theo chu kỳ và xử lý theo mô
-hình **near real-time** (gần thời gian thực). Đây là Speed Layer; `foreachBatch`
-của Spark là cơ chế micro-batch trong streaming, không phải Batch Layer xử lý
-dữ liệu lịch sử.
-
-## Sơ đồ tổng thể
+# Luồng stream
 
 ```mermaid
 flowchart TD
-    A[Danh sách người dùng Showoffs] --> B[Last.fm Recent Tracks API]
-    B --> C[Scrobble Producer<br/>poll mỗi 60 giây]
-    C --> D[(Kafka<br/>scrobble.raw)]
+    A[Danh sách user Showoffs<br/>chỉ trạng thái A] --> B[Producer<br/>lịch theo user, from = scrobble cuối]
+    L[(Bộ giới hạn tốc độ<br/>Redis, LASTFM_MAX_RPS)] -.-> B
+    B -->|extended=1| C[Last.fm user.getRecentTracks]
+    C --> D[(Kafka scrobble.raw<br/>key = username)]
 
-    D --> E[Spark Structured Streaming<br/>micro-batch mỗi 10 giây]
-    E --> F[Phân tích và kiểm tra event]
-    F --> G[Kiểm tra event_id và đánh dấu event đến trễ]
+    D --> E[Spark Structured Streaming<br/>chỉ đọc Kafka, micro-batch 10 giây]
+    E --> F[process_events cho từng partition]
+    F --> G[Khử trùng event_id<br/>Lua SET NX trên Redis]
+    G --> H[(HBase<br/>music_scrobble_events, fact_listen)]
+    G --> I[(Redis<br/>thống kê user, top-K 5 phút/1 giờ)]
+    F --> S[(HBase snapshot user/ngày<br/>một lần mỗi user mỗi partition)]
+    F --> J{Metadata dùng chung<br/>đã có trong Redis/HBase?}
 
-    G --> H[(HBase<br/>music_scrobble_events)]
-    G --> I[(Redis<br/>thống kê realtime)]
-    G --> J{Metadata đã tồn tại?}
-
-    J -- Có --> K[Không gửi yêu cầu]
-    J -- Chưa --> L[(Kafka<br/>metadata.request)]
-    L --> M[Metadata Worker]
-    M --> N[Last.fm getInfo APIs<br/>User / Track / Artist / Album]
-
-    N -- Thành công --> O[(Kafka<br/>metadata.enriched)]
-    N -- Lỗi sau retry --> P[(Kafka<br/>metadata.dead-letter)]
-
+    J -- Có --> K[Bỏ qua]
+    J -- Chưa --> X{Khóa SET NX<br/>đã có yêu cầu?}
+    X -- Có --> K
+    X -- Chưa --> M1[(Kafka metadata.request)]
+    M1 --> W[Metadata Worker]
+    L -.-> W
+    W --> N[Last.fm getInfo<br/>không kèm username]
+    N -- OK --> O[(Kafka metadata.enriched)]
+    N -- Lỗi 29 --> W
+    N -- Lỗi tạm thời --> W
+    N -- Lỗi vĩnh viễn / hết thử lại --> P[(Kafka metadata.dead-letter)]
+    N -- Lỗi 26 / 10 --> Z[Dừng worker]
     O --> Q[Metadata Sink]
     P --> Q
-    Q --> R[(HBase<br/>User / Track / Artist / Album Metadata)]
-    Q --> S[(Redis<br/>Metadata Cache)]
+    Q --> R[(HBase metadata)]
+    Q --> T[(Redis cache)]
 
-    T[API hoặc công cụ truy vấn] --> I
-    T --> H
-    T --> R
-    T --> S
+    API[API HTTP] --> I
+    API --> H
 ```
 
-## Luồng xử lý event
+## Thành phần
 
-```text
-Last.fm Recent Tracks
-    → Scrobble Producer
-    → Kafka: scrobble.raw
-    → Spark Structured Streaming
-       ├─ HBase: lưu event lâu dài
-       ├─ Redis: thống kê và lịch sử gần đây
-       └─ Kafka: metadata.request nếu thiếu metadata
-```
+| Thành phần | File | Việc làm |
+|---|---|---|
+| Producer | `stream/producer/produce_scrobbles.py` | Poll user theo lịch riêng (60 → 900 giây), chỉ lấy scrobble mới (`from`), gửi vào Kafka, lưu checkpoint |
+| Replay | `stream/producer/replay_scrobbles.py` | Phát lại log JSONL với tốc độ tuỳ chọn để demo và đo tải |
+| Spark job | `stream/processing/spark_speed_layer.py` | Đọc Kafka, gọi `process_events` cho từng partition |
+| Lõi xử lý | `stream/processing/pipeline.py` | Toàn bộ nghiệp vụ speed layer (test được không cần Spark) |
+| Redis | `stream/processing/realtime_store.py` | Lua khử trùng và cập nhật thống kê; top-K theo cửa sổ |
+| Worker | `stream/metadata/metadata_worker.py` | Gọi `getInfo`, xử lý lỗi theo loại |
+| Sink | `stream/metadata/metadata_sink.py` | Ghi kết quả metadata vào HBase và Redis |
+| API | `stream/api/server.py` | Đọc Redis và HBase |
 
-Spark không loại event chỉ vì thời điểm nghe đã cũ. Mọi scrobble hợp lệ được
-ghi idempotent vào HBase; Redis dùng `event_id` để tránh tăng thống kê nhiều
-lần. Event đến trễ hơn ngưỡng cấu hình vẫn được xử lý và được lưu thêm trong
-`music_late_events` để kiểm tra. Redis phục vụ kết quả đang được truy vấn
-thường xuyên, còn HBase lưu event lâu dài.
+## Điều cần biết khi đọc số liệu
 
-## Luồng bổ sung metadata
+- **Không có watermark.** Khử trùng bằng Redis; cửa sổ 5 phút và 1 giờ là bucket cộng dồn theo thời gian nghe, không phải cửa sổ stateful của Spark.
+- **At-least-once.** Chạy lại micro-batch không đếm dôi nhờ khóa khử trùng (TTL 7 ngày); nếu quá TTL một event lặp lại sẽ đếm lại.
+- **Độ trễ end-to-end** gồm: Last.fm chỉ ghi scrobble sau khi nghe ít nhất nửa bài (hoặc 4 phút), cộng chu kỳ poll của user (≥ 60 giây), cộng micro-batch Spark (10 giây). Con số trên Spark UI chỉ là phần cuối.
+- **Thời gian theo UTC.** `fact_listen.dow` theo ISO (1 = Thứ hai … 7 = Chủ nhật).
 
-```text
-Kafka: metadata.request
-    → Metadata Worker
-    → Last.fm getInfo APIs
-    → Kafka: metadata.enriched
-    → Metadata Sink
-       ├─ HBase Metadata
-       └─ Redis Metadata Cache
-```
+## Bảng HBase
 
-Nếu Last.fm API vẫn lỗi sau các lần thử lại, worker gửi message vào
-`metadata.dead-letter`. Metadata Sink lưu thông tin lỗi để có thể kiểm tra và
-xử lý lại sau.
-
-## Vì sao không thể xử lý realtime tuyệt đối?
-
-Hệ thống không thể nhận scrobble ngay tại thời điểm người dùng bắt đầu hoặc
-kết thúc bài hát vì nguồn Last.fm Recent Tracks hoạt động theo cách **polling**.
-Last.fm không chủ động đẩy từng lượt nghe vào Kafka bằng webhook hoặc
-WebSocket.
-
-### 1. Producer phải gọi API theo chu kỳ
-
-Producer hiện gọi Last.fm API mỗi 60 giây:
-
-```text
-Gọi Last.fm API → xử lý kết quả → chờ 60 giây → gọi lại
-```
-
-Nếu một scrobble xuất hiện ngay sau lần gọi trước, hệ thống có thể phải chờ gần
-60 giây mới phát hiện được.
-
-### 2. Bài đang phát chưa phải là scrobble hoàn chỉnh
-
-Last.fm có thể trả về một bài đang phát với trạng thái:
-
-```json
-{
-  "@attr": {
-    "nowplaying": "true"
-  }
-}
-```
-
-Event này thường chưa có `date.uts` và chưa chắc sẽ trở thành một scrobble hợp
-lệ. Người dùng có thể chuyển bài trước khi nghe đủ thời lượng. Hệ thống hiện
-chỉ gửi các scrobble đã hoàn thành để tránh đếm sai hoặc ghi trùng.
-
-### 3. Spark Streaming xử lý theo micro-batch
-
-Spark Structured Streaming gom các event Kafka trong một khoảng thời gian ngắn
-rồi mới xử lý. Trigger hiện tại là khoảng 10 giây:
-
-```text
-Event vào Kafka → chờ micro-batch → Spark xử lý → Redis/HBase
-```
-
-Đây vẫn là xử lý streaming, nhưng không phải xử lý tức thì từng mili-giây.
-
-### 4. Không thể giảm polling quá thấp cho 500 người dùng
-
-Nếu gọi API cho 500 người dùng mỗi 10 giây, số request ước tính là:
-
-```text
-500 người dùng × 6 lần/phút = 3.000 request/phút
-```
-
-Tần suất này gây tải lớn, dễ gặp giới hạn API và có thể khiến Last.fm từ chối
-hoặc làm chậm request. Vì vậy cần cân bằng giữa độ trễ và số lượng API request.
-
-
-## Điều kiện để đạt realtime thực sự
-
-Muốn xử lý realtime thực sự, nguồn phát nhạc phải chủ động gửi event trực tiếp:
-
-```text
-Music Player
-    → gửi event play/complete ngay lập tức
-    → Kafka
-    → Stream Processor
-    → Redis/HBase
-```
-
-Nguồn dữ liệu cần hỗ trợ webhook, WebSocket hoặc tích hợp Kafka producer trực
-tiếp trong ứng dụng phát nhạc. Khi chỉ sử dụng Last.fm Recent Tracks API, hệ
-thống phù hợp nhất với mô hình near real-time.
+| Bảng | Nội dung |
+|---|---|
+| `music_scrobble_events` | event thô, row key `salt#user#đảo-thời-gian#event_id` (mới nhất trước) |
+| `fact_listen` | dòng phẳng khớp bảng trường nhóm đã chốt (`docs/fields.csv`), cùng row key |
+| `music_late_events` | event đến muộn |
+| `music_user_metrics_realtime` | snapshot thống kê theo user/ngày |
+| `music_user_profile`, `music_track_metadata`, `music_artist_metadata`, `music_album_metadata` | metadata dùng chung |
+| `music_user_*_stats` | `userplaycount`, chỉ có khi chạy `--per-user-stats` |
+| `music_metadata_failures` | dead-letter |

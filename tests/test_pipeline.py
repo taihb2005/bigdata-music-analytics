@@ -248,7 +248,9 @@ class StreamAnalyticsTests(unittest.TestCase):
             [request["entity_type"] for request in requests],
             ["user", "artist", "track", "album"],
         )
-        self.assertEqual(requests[1]["entity_id"], "artist-mbid")
+        # Khóa dựa trên TÊN chuẩn hóa, không dùng MBID (MBID lúc có lúc không cho cùng một nghệ sĩ).
+        self.assertEqual(requests[1]["entity_id"], entity_id("artist", "", "Artist"))
+        self.assertEqual(requests[1]["entity_id"], entity_id("artist", "khac-mbid", "ARTIST"))
         self.assertEqual(
             requests[2]["entity_id"], entity_id("track", "", "Artist", "Song")
         )

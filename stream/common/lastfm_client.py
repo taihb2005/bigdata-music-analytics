@@ -3,12 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from stream.common.ids import (
+    make_event_id,
+    make_track_id,
+    normalize_text,
+)
 
 
 API_URL = "https://ws.audioscrobbler.com/2.0/"
@@ -35,19 +42,50 @@ class LastFmError(RuntimeError):
         self.code = code
 
 
+class LastFmRateLimitError(LastFmError):
+    """Vượt giới hạn tốc độ (lỗi 29 hoặc HTTP 429): phải nghỉ rồi thử lại, KHÔNG phải lỗi vĩnh viễn."""
+
+
+class LastFmFatalError(LastFmError):
+    """API key bị khóa hoặc sai (26, 10, 4, 9, 13): dừng chương trình, thử lại cũng vô ích."""
+
+
+RATE_LIMIT_CODES = {29}
+FATAL_CODES = {4, 9, 10, 13, 26}
+NOT_FOUND_CODES = {6, 7}
+PRIVATE_CODES = {17}  # user ẩn lịch sử nghe
+TRANSIENT_CODES = {8, 11, 16}
+
+
+def classify_error(code: int | None) -> str:
+    """Phân loại mã lỗi Last.fm: rate_limit | fatal | not_found | private | transient | permanent."""
+    if code in RATE_LIMIT_CODES:
+        return "rate_limit"
+    if code in FATAL_CODES:
+        return "fatal"
+    if code in NOT_FOUND_CODES:
+        return "not_found"
+    if code in PRIVATE_CODES:
+        return "private"
+    if code in TRANSIENT_CODES:
+        return "transient"
+    return "permanent"
+
+
 class LastFmClient:
-    def __init__(self, api_key: str, timeout: float = 20.0) -> None:
-        """Khởi tạo client với API key và thời gian chờ HTTP."""
+    def __init__(self, api_key: str, timeout: float = 20.0, limiter: Any = None) -> None:
+        """Khởi tạo client với API key, thời gian chờ HTTP và bộ giới hạn tốc độ (acquire/cooldown)."""
         if not api_key:
             raise ValueError("LASTFM_API_KEY is missing")
         self.api_key = api_key
         self.timeout = timeout
+        self.limiter = limiter
 
     @classmethod
-    def from_env(cls, timeout: float = 20.0) -> "LastFmClient":
+    def from_env(cls, timeout: float = 20.0, limiter: Any = None) -> "LastFmClient":
         """Tạo Last.fm client từ biến môi trường LASTFM_API_KEY."""
         load_dotenv()
-        return cls(os.getenv("LASTFM_API_KEY", ""), timeout=timeout)
+        return cls(os.getenv("LASTFM_API_KEY", ""), timeout=timeout, limiter=limiter)
 
     def call(self, method: str, **params: Any) -> dict[str, Any]:
         """Gọi Last.fm và chuyển lỗi HTTP/API thành LastFmError."""
@@ -55,11 +93,15 @@ class LastFmClient:
             {"method": method, "api_key": self.api_key, "format": "json", **params}
         )
         request = Request(f"{API_URL}?{query}", headers={"User-Agent": "bigdata-music-analytics/1.0"})
+        if self.limiter is not None:
+            self.limiter.acquire()  # mọi request (kể cả thử lại) đều đi qua bộ giới hạn
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 payload = json.load(response)
         except HTTPError as exc:
-            raise LastFmError(f"Last.fm HTTP error {exc.code}") from exc
+            if exc.code == 429:
+                raise LastFmRateLimitError("Last.fm HTTP 429", code=29) from exc
+            raise LastFmError(f"Last.fm HTTP error {exc.code}", code=16 if exc.code >= 500 else None) from exc
         except URLError as exc:
             raise LastFmError(f"Cannot connect to Last.fm: {exc.reason}") from exc
         except json.JSONDecodeError as exc:
@@ -67,38 +109,61 @@ class LastFmClient:
 
         if "error" in payload:
             error_code = int(payload["error"]) if str(payload["error"]).isdigit() else None
-            raise LastFmError(
+            kind = classify_error(error_code)
+            error_class = {
+                "rate_limit": LastFmRateLimitError,
+                "fatal": LastFmFatalError,
+            }.get(kind, LastFmError)
+            raise error_class(
                 f"Last.fm API error {payload.get('error')}: {payload.get('message', 'unknown')}",
                 code=error_code,
             )
         return payload
 
     def recent_tracks(
-        self, username: str, limit: int = 200, page: int = 1
+        self,
+        username: str,
+        limit: int = 200,
+        page: int = 1,
+        from_ts: int | None = None,
+        to_ts: int | None = None,
     ) -> dict[str, Any]:
-        """Lấy các bài nghe gần nhất của một người dùng Last.fm."""
-        return self.call(
-            "user.getRecentTracks", user=username, limit=limit, page=page, extended=0
-        )
+        """Lấy bài nghe gần nhất của một user. extended=1 để có `loved` và artist đầy đủ.
+
+        from_ts/to_ts (Unix giây, UTC) giới hạn khoảng thời gian: chỉ lấy bài mới từ lần poll trước.
+        """
+        params: dict[str, Any] = {"user": username, "limit": limit, "page": page, "extended": 1}
+        if from_ts:
+            params["from"] = int(from_ts)
+        if to_ts:
+            params["to"] = int(to_ts)
+        return self.call("user.getRecentTracks", **params)
 
     def user_info(self, username: str) -> dict[str, Any]:
         """Lấy hồ sơ và thống kê tổng quan của người dùng."""
         return self.call("user.getInfo", user=username)
 
-    def track_info(self, username: str, artist: str, track: str) -> dict[str, Any]:
-        """Lấy metadata bài hát và lượt nghe của người dùng hiện tại."""
+    @staticmethod
+    def _user_param(username: str | None) -> dict[str, Any]:
+        """username rỗng/None = yêu cầu metadata dùng chung (không có userplaycount)."""
+        return {"user": username} if username else {}
+
+    def track_info(self, username: str | None, artist: str, track: str) -> dict[str, Any]:
+        """Lấy metadata bài hát; kèm userplaycount nếu truyền username."""
         return self.call(
-            "track.getInfo", user=username, artist=artist, track=track, autocorrect=1
+            "track.getInfo", artist=artist, track=track, autocorrect=1, **self._user_param(username)
         )
 
-    def artist_info(self, username: str, artist: str) -> dict[str, Any]:
-        """Lấy metadata nghệ sĩ và lượt nghe của người dùng hiện tại."""
-        return self.call("artist.getInfo", user=username, artist=artist, autocorrect=1)
-
-    def album_info(self, username: str, artist: str, album: str) -> dict[str, Any]:
-        """Lấy metadata album và lượt nghe của người dùng hiện tại."""
+    def artist_info(self, username: str | None, artist: str) -> dict[str, Any]:
+        """Lấy metadata nghệ sĩ; kèm userplaycount nếu truyền username."""
         return self.call(
-            "album.getInfo", user=username, artist=artist, album=album, autocorrect=1
+            "artist.getInfo", artist=artist, autocorrect=1, **self._user_param(username)
+        )
+
+    def album_info(self, username: str | None, artist: str, album: str) -> dict[str, Any]:
+        """Lấy metadata album; kèm userplaycount nếu truyền username."""
+        return self.call(
+            "album.getInfo", artist=artist, album=album, autocorrect=1, **self._user_param(username)
         )
 
 
@@ -134,10 +199,13 @@ def normalize_track(username: str, track: dict[str, Any]) -> dict[str, Any]:
     track_name = str(track.get("name", ""))
     track_mbid = str(track.get("mbid", ""))
 
-    identity = "|".join(
-        [username.lower(), track_mbid or track_name.lower(), artist["name"].lower(), uts or "now-playing"]
-    )
-    event_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if uts:
+        # Cùng công thức với fact_listen.event_id: sha1(user_id, listened_at, track_id)[:32].
+        track_id = make_track_id(normalize_text(artist["name"]), normalize_text(track_name))
+        event_id = make_event_id(username.lower(), uts, track_id)
+    else:  # bài đang phát: chưa có thời điểm nghe
+        identity = "|".join([username.lower(), track_name.lower(), artist["name"].lower(), "now-playing"])
+        event_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     return {
         "schema_version": 2,
