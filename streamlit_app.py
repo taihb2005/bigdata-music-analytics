@@ -85,7 +85,6 @@ with st.sidebar:
     windows = ["5m", "15m", "1h", "6h", "24h"]
     track_window = st.selectbox("Top bài hát · cửa sổ", windows, index=2)
     artist_window = st.selectbox("Top nghệ sĩ · cửa sổ", windows, index=4)
-    album_window = st.selectbox("Top album · cửa sổ", windows, index=0)
     st.caption("API mặc định: cổng 8001")
     load_data = st.button("↻  Tải / làm mới dữ liệu", type="primary", use_container_width=True)
 
@@ -109,11 +108,10 @@ if load_data:
                 "events": get_json(base, f"users/{user}/events", {"limit": 20}),
                 "global_tracks": get_json(base, "global/top", {"kind": "tracks", "window": track_window, "k": 10}),
                 "global_artists": get_json(base, "global/top", {"kind": "artists", "window": artist_window, "k": 10}),
-                "global_albums": get_json(base, "global/top", {"kind": "albums", "window": album_window, "k": 10}),
             }
             st.session_state["music_analytics_user"] = username.strip()
             st.session_state["music_analytics_windows"] = {
-                "tracks": track_window, "artists": artist_window, "albums": album_window,
+                "tracks": track_window, "artists": artist_window,
             }
 
 results = st.session_state.get("music_analytics_results")
@@ -127,7 +125,7 @@ else:
     recent_events = (events or {}).get("events", []) if isinstance(events, dict) else []
     current_user = st.session_state.get("music_analytics_user", "")
     global_windows = st.session_state.get(
-        "music_analytics_windows", {"tracks": "1h", "artists": "24h", "albums": "5m"}
+        "music_analytics_windows", {"tracks": "1h", "artists": "24h"}
     )
 
     health, health_error = results["health"]
@@ -200,16 +198,15 @@ else:
         st.caption("Top toàn hệ thống theo cửa sổ đã chọn ở thanh bên")
         global_ends = [
             (results[key][0] or {}).get("end")
-            for key in ("global_tracks", "global_artists", "global_albums")
+            for key in ("global_tracks", "global_artists")
             if not results[key][1] and isinstance(results[key][0], dict)
         ]
         latest_end = next((epoch for epoch in global_ends if epoch is not None), None)
         st.caption(f"Thời điểm dữ liệu: {format_epoch(latest_end)}")
-        track_col, artist_col, album_col = st.columns(3)
+        track_col, artist_col = st.columns(2)
         for column, key, title, kind in [
             (track_col, "global_tracks", "Bài hát", "tracks"),
             (artist_col, "global_artists", "Nghệ sĩ", "artists"),
-            (album_col, "global_albums", "Album", "albums"),
         ]:
             with column:
                 st.markdown(f"### {title} · {global_windows[kind]}")
