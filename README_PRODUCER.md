@@ -11,8 +11,8 @@ Celery Beat → Redis → Celery Worker → Last.fm API → Chuẩn hóa → Kaf
 ```
 
 Mã đã được tạo sẵn trong thư mục này. `crawl.py` và dữ liệu crawler cũ giữ nguyên.
-`exactor.py`, `lastfm_client.py`, `normalize.py`, `kafka_writer.py`, `scheduler.py`
-đang là các file trống bạn tạo trước đó; bản này dùng các file trong bảng ở cuối.
+Các file trống cũ (`exactor.py`, `lastfm_client.py`, `normalize.py`, `kafka_writer.py`,
+`scheduler.py`) đã được xóa; bản này dùng các file trong bảng ở cuối.
 
 ## 0–5 phút: điền cấu hình
 
