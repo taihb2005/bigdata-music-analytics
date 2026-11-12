@@ -1,0 +1,17 @@
+# Kafka clients (Pure Python for Consumer, Librdkafka for Producer)
+kafka-python==2.2.15
+confluent-kafka>=2.6.0,<3.0.0
+
+# Storage / MinIO S3 (Consumer Data Lake)
+minio>=7.2.0
+
+# Task Queue & Cache (Producer Celery Beat & Worker)
+celery[redis]>=5.5.0,<6.0.0
+redis>=5.0.0
+
+# HTTP & Schema Validation (Last.fm Crawler & JSON Validator)
+requests>=2.32.4,<3.0.0
+jsonschema>=4.23.0,<5.0.0
+
+# Configuration Management
+python-dotenv>=1.0.0

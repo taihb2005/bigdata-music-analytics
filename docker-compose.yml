@@ -1,65 +1,15 @@
-# Cần file .env (xem .env.example): LASTFM_API_KEY, REDIS_PASSWORD (và MINIO_* nếu chạy profile batch).
-# Mọi cổng chỉ nghe ở 127.0.0.1 của máy bạn. Muốn máy khác truy cập thì dùng mạng ảo (Tailscale...) chứ
-# đừng mở ra 0.0.0.0, vì Kafka, HBase Thrift và API không có xác thực.
+# ==============================================================================
+# Docker Compose Root - Quản lý toàn bộ hệ sinh thái Big Data Music Analytics
+# Sử dụng tính năng `include` để module hóa: Kafka (docker/) và Batch (batch/)
+# ==============================================================================
+
+include:
+  - path: docker/docker-compose.network.yml
+  - path: docker/kafka.yml
+  - path: batch/docker-compose.yml
+
+# ==============================================================================
 services:
-  kafka:
-    image: apache/kafka:3.8.0
-    container_name: kafka_container
-    hostname: kafka
-    restart: unless-stopped
-    mem_limit: 1g
-    ports:
-      - "127.0.0.1:9092:9092"
-    expose:
-      - "9094"
-    environment:
-      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9094,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # Mặc định image ghi log vào /tmp/kafka-logs TRONG container, nên volume bên dưới trống và mọi dữ liệu
-      # mất khi tạo lại container (offset quay về 0 trong khi checkpoint Spark vẫn giữ offset cũ -> Spark bỏ
-      # qua message mới). Trỏ log vào volume.
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-    volumes:
-      - kafka_data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9094 >/dev/null 2>&1"]
-      interval: 10s
-      timeout: 15s
-      retries: 12
-      start_period: 20s
-    networks:
-      - data-net
-      - inter-net
-
-  minio:
-    profiles: ["batch"]
-    # Image chính thức của MinIO (bản cũ dùng image cá nhân không rõ nguồn). Nên ghim một phiên bản cụ thể.
-    image: minio/minio:latest
-    container_name: datalake
-    hostname: minio
-    ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-}
-    command: server /data --console-address ":9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - data-net
-
   redis:
     image: redis:8.2-alpine
     container_name: redis
@@ -69,9 +19,6 @@ services:
       - "127.0.0.1:6379:6379"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Đặt REDIS_PASSWORD trong file .env}
-    # Mật khẩu lấy từ .env nên không còn file redis.conf phải tạo tay. Mọi khóa của speed layer đều có TTL
-    # nên bộ nhớ tự giới hạn. noeviction: nếu vẫn đầy thì Redis báo lỗi ghi (thấy được trong log Spark),
-    # thay vì volatile-lru lặng lẽ xóa khóa khử trùng làm event cũ bị đếm lại.
     command:
       - redis-server
       - --requirepass
@@ -106,16 +53,9 @@ services:
       - "127.0.0.1:9090:9090"
       - "127.0.0.1:8080:8080"
     volumes:
-      # v2: volume bản cũ (hbase_data) bị kẹt "Master is initializing" vì ZooKeeper không được lưu; giữ lại
-      # để tham khảo, xóa tay nếu không cần: docker volume rm bigdata-music-analytics_hbase_data
       - hbase_data_v2:/hbase-data
-      # ZooKeeper nhúng ghi vào hbase.tmp.dir (/tmp/hbase-root/zookeeper). Phải lưu cùng /hbase-data:
-      # nếu chỉ lưu /hbase-data, sau khi tạo lại container master thấy region "đang mở" trên một
-      # region server cũ không còn trong ZooKeeper và kẹt mãi ở "Master is initializing".
       - hbase_zk:/tmp/hbase-root
     healthcheck:
-      # Cổng Thrift mở sớm hơn master rất nhiều; chỉ coi là sẵn sàng khi master trả lời được lệnh `list`
-      # (bản cũ báo healthy cả khi master kẹt "initializing", nên stream-init chạy rồi hết giờ chờ).
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9090' && echo list | hbase shell -n 2>&1 | grep -q 'row(s)'"]
       interval: 20s
       timeout: 60s
@@ -141,18 +81,15 @@ services:
         condition: service_healthy
       hbase:
         condition: service_healthy
+    restart: "no"
     networks:
       - data-net
-    restart: "no"
 
   scrobble-producer:
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
     container_name: scrobble_producer
-    mem_limit: 256m
-    # Chỉ poll user trạng thái A. Tổng request/giây tới Last.fm do LASTFM_MAX_RPS quyết định và được
-    # dùng chung với metadata-worker qua Redis. Poll 500 user cần >= 500 / LASTFM_MAX_RPS giây một vòng.
     command:
       - python
       - stream/producer/produce_scrobbles.py
@@ -168,8 +105,6 @@ services:
       - "900"
       - --limit
       - "50"
-    env_file:
-      - .env
     volumes:
       - ./dataset/state:/app/dataset/state
     depends_on:
@@ -177,19 +112,16 @@ services:
         condition: service_healthy
       stream-init:
         condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
     networks:
       - data-net
-    restart: unless-stopped
 
   spark-speed-layer:
     build:
       context: .
       dockerfile: docker/spark/Dockerfile
     container_name: spark_speed_layer
-    mem_limit: 3g
-    environment:
-      PYTHONPATH: /opt/app
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
     command:
       - /opt/spark/bin/spark-submit
       - --master
@@ -212,50 +144,53 @@ services:
       - --redis-url
       - redis://redis:6379/0
       - --checkpoint
-      # v4: checkpoint v3 thuộc về topic Kafka cũ (mất khi tạo lại container, xem KAFKA_LOG_DIRS).
       - /opt/app/dataset/state/spark-speed-layer-v4
     volumes:
-      - ./:/opt/app
+      - .:/opt/app
+    environment:
+      PYTHONPATH: /opt/app
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
     depends_on:
-      stream-init:
-        condition: service_completed_successfully
       redis:
         condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 3g
     networks:
       - data-net
-    restart: unless-stopped
 
   metadata-worker:
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
     container_name: metadata_worker
-    mem_limit: 256m
     command:
       - python
       - stream/metadata/metadata_worker.py
-      - --bootstrap-servers
-      - kafka:9094
       - --redis-url
       - redis://redis:6379/0
-    env_file:
-      - .env
+      - --kafka-bootstrap
+      - kafka:9094
+      - --api-key
+      - ${LASTFM_API_KEY}
+      - --max-rps
+      - ${LASTFM_MAX_RPS:-1.0}
     depends_on:
       redis:
         condition: service_healthy
       stream-init:
         condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
     networks:
       - data-net
-    restart: unless-stopped
 
   metadata-sink:
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
     container_name: metadata_sink
-    mem_limit: 256m
-    # Mặc định KHÔNG lưu wiki, bio, danh sách bài của album và tên thật (thêm --store-long-text, --keep-realname nếu cần).
     command:
       - python
       - stream/metadata/metadata_sink.py
@@ -265,23 +200,21 @@ services:
       - hbase
       - --redis-url
       - redis://redis:6379/0
-    env_file:
-      - .env
     depends_on:
-      stream-init:
-        condition: service_completed_successfully
       redis:
         condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
     networks:
       - data-net
-    restart: unless-stopped
 
   api:
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
     container_name: stream_api
-    mem_limit: 256m
     command:
       - python
       - stream/api/server.py
@@ -289,8 +222,6 @@ services:
       - redis://redis:6379/0
       - --hbase-host
       - hbase
-    env_file:
-      - .env
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
@@ -298,45 +229,50 @@ services:
         condition: service_healthy
       stream-init:
         condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
     networks:
       - data-net
-    restart: unless-stopped
 
-  # Phát lại log giả để demo và đo tải (không gọi Last.fm):
-  #   python -m stream.tools.gen_sample_events        (tạo dataset/sample/scrobbles.jsonl)
-  #   docker compose --profile replay run --rm replay
   replay:
-    profiles: ["replay"]
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
+    container_name: scrobble_replay
+    profiles: ["tools"]
     command:
       - python
-      - stream/producer/replay_scrobbles.py
+      - stream/producer/produce_scrobbles.py
       - --bootstrap-servers
       - kafka:9094
-      - --file
-      - /app/dataset/sample/scrobbles.jsonl
-      - --rate
-      - ${REPLAY_RATE:-50}
-    volumes:
-      - ./dataset/sample:/app/dataset/sample:ro
+      - --redis-url
+      - redis://redis:6379/0
+      - --statuses
+      - A
+      - --replay-from-beginning
+      - --min-interval
+      - "0.1"
+      - --max-interval
+      - "0.5"
     depends_on:
+      redis:
+        condition: service_healthy
       stream-init:
         condition: service_completed_successfully
+    restart: "no"
     networks:
       - data-net
 
 volumes:
-  kafka_data:
-  redis_data:
-  minio_data:
   hbase_data_v2:
   hbase_zk:
+  redis_data:
 
 networks:
   data-net:
+    name: data-net
     driver: bridge
   inter-net:
+    name: inter-net
     driver: bridge
     internal: true

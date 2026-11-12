@@ -3,6 +3,7 @@ services:
     image: apache/kafka:latest
     container_name: kafka_container
     hostname: kafka
+    restart: unless-stopped
     ports:
       - "9092:9092"
     expose:
@@ -20,42 +21,38 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    networks:
-      - bigdata-common-net
-      - batch-net
-
-  minio:
-    image: taihb2005/minio:1.0.0
-    container_name: minio-storage
-    hostname: minio
-    restart: unless-stopped
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
-      - ${MINIO_HOST_VOLUME}:/data
-    command: server /data --console-address ":9001"
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9094 >/dev/null 2>&1",
+        ]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 15s
+      retries: 12
+      start_period: 20s
     networks:
       - bigdata-common-net
-
-  redis:
-    image: redis:8.2-alpine
-    container_name: redis
-    restart: always
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-      - ../redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
-    networks:
       - batch-net
+      - data-net
+      - inter-net
+
+networks:
+  bigdata-common-net:
+    name: bigdata-common-net
+    driver: bridge
+  batch-net:
+    name: batch-net
+    driver: bridge
+  data-net:
+    name: data-net
+    driver: bridge
+  inter-net:
+    name: inter-net
+    driver: bridge
+
+volumes:
+  kafka_data:

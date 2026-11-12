@@ -1,6 +1,6 @@
-# ==========================================
+# ==============================================================================
 # 1. Môi trường Python & Caching (Python & Virtual Environments)
-# ==========================================
+# ==============================================================================
 # Bytecode & Caches
 __pycache__/
 *.py[cod]
@@ -36,7 +36,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 
-# Thư viện quản lý gói & công cụ kiểm tra (Tools & Testing)
+# Thư viện kiểm thử & Coverage (Testing & QA)
 .pytest_cache/
 .coverage
 .coverage.*
@@ -49,30 +49,34 @@ nosetests.xml
 coverage.xml
 *.cover
 
-# ==========================================
+# ==============================================================================
 # 2. Jupyter Notebooks
-# ==========================================
+# ==============================================================================
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
 *.run.xml
 
-# ==========================================
-# 3. Big Data Datalake & File Dữ Liệu (Data Files)
-# ==========================================
-# Thư mục lưu dữ liệu cục bộ (Bronze, Silver, Gold, Raw, Processed, Staging)
-data/
-datasets/
-storage/
+# ==============================================================================
+# 3. Big Data Data Lake & File Dữ Liệu (Data Files)
+# ==============================================================================
+# Thư mục dữ liệu cục bộ (Bronze, Silver, Gold, Raw, Processed, Staging)
+data/producer/
 raw_data/
 processed_data/
+storage/
+
+# Thư mục dữ liệu phát sinh theo quy trình
+dataset/raw/
+dataset/state/
+dataset/sample/
+dataset/*.xlsx
+
+# Định dạng dữ liệu nhị phân & file nén lớn
 *.parquet
 *.orc
 *.avro
 *.feather
 *.h5
-*.csv
-*.tsv
-*.jsonl
 *.gz
 *.tar.gz
 *.zip
@@ -81,11 +85,16 @@ processed_data/
 
 # Giữ lại cấu trúc thư mục nếu có file .gitkeep
 !**/data/**/.gitkeep
+!**/dataset/**/.gitkeep
 
-# ==========================================
+# Không bỏ qua các file tài liệu hoặc cấu hình dạng CSV/JSON trong docs/
+!docs/**/*.csv
+!docs/*.csv
+
+# ==============================================================================
 # 4. Apache Spark & Hadoop
-# ==========================================
-# Thư mục metastore và warehouse của Spark/Hive
+# ==============================================================================
+# Metastore và Warehouse của Spark/Hive
 spark-warehouse/
 metastore_db/
 derby.log
@@ -105,47 +114,56 @@ event-logs/
 _temporary/
 _SUCCESS
 
-# ==========================================
+# ==============================================================================
 # 5. Apache Kafka, Streaming & Broker Logs
-# ==========================================
+# ==============================================================================
 kafka_data/
 zookeeper-data/
 *.kafka
 kafka-logs/
 zookeeper.out
 
-# ==========================================
+# ==============================================================================
 # 6. MinIO & Object Storage cục bộ
-# ==========================================
+# ==============================================================================
 minio_data/
 .minio.sys/
 
-# ==========================================
-# 7. Redis & Cơ sở dữ liệu (Databases & Caches)
-# ==========================================
+# ==============================================================================
+# 7. Redis & Celery (Databases, Caches & Schedules)
+# ==============================================================================
 dump.rdb
 appendonly.aof
 *.rdb
-redis/redis.conf
 redis_data/
+redis/redis.conf
+!redis/redis.conf.example
 
-# ==========================================
+# Celery Beat schedules
+celerybeat-schedule*
+*.sched
+
+# ==============================================================================
 # 8. Apache Airflow / Orchestration (nếu dùng)
-# ==========================================
+# ==============================================================================
 airflow/
 airflow.db
 airflow.cfg
 airflow.pod
 standalone_admin_password.txt
 
-# ==========================================
+# ==============================================================================
 # 9. Biến môi trường & Bảo mật (Secrets & Credentials)
-# ==========================================
+# ==============================================================================
 .env
 .env.*
-docker/.env
 *.env
+docker/.env
+batch/.env
 !*.env.example
+!**/*.env.example
+
+# Khóa bí mật & Chứng chỉ số
 *.pem
 *.key
 *.crt
@@ -155,9 +173,9 @@ docker/.env
 credentials.json
 service-account*.json
 
-# ==========================================
+# ==============================================================================
 # 10. Logs & Tệp tạm (Logs & Temp Files)
-# ==========================================
+# ==============================================================================
 logs/
 *.log
 *.pid
@@ -166,9 +184,9 @@ logs/
 tmp/
 temp/
 
-# ==========================================
+# ==============================================================================
 # 11. IDE & Trình soạn thảo mã nguồn (Editors & IDEs)
-# ==========================================
+# ==============================================================================
 # VS Code
 .vscode/*
 !.vscode/settings.json
@@ -188,9 +206,9 @@ temp/
 .project
 .pydevproject
 
-# ==========================================
+# ==============================================================================
 # 12. Hệ điều hành (OS Generated Files)
-# ==========================================
+# ==============================================================================
 # Windows
 Thumbs.db
 Thumbs.db:encryptable
@@ -209,10 +227,3 @@ $RECYCLE.BIN/
 
 # Linux
 *~
-redis/redis.conf
-__pycache__/
-*.py[cod]
-dataset/raw/
-dataset/state/
-dataset/sample/
-.vscode/

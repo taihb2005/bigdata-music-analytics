@@ -6,3 +6,18 @@ dataset/LastFM User Charts.xlsx
 dataset/raw
 dataset/state
 redis/redis.conf
+
+# Các thư mục và file được nạp vào Docker context
+!batch/
+!batch/**
+!stream/
+!stream/**
+!scripts/
+!scripts/**
+!docker/
+!docker/**
+!tests/
+!tests/**
+!dataset/users/
+!dataset/users/**
+!requirements.txt

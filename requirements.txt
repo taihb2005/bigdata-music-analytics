@@ -3,3 +3,4 @@ openpyxl==3.1.5
 redis==7.0.1
 happybase==1.2.0
 setuptools==80.9.0
+

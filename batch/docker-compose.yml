@@ -1,0 +1,214 @@
+include:
+  - ../docker/kafka.yml
+
+services:
+  # ============================================================================
+  # 1. Hạ tầng lưu trữ & Hàng đợi của Batch (MinIO & Redis)
+  # ============================================================================
+  minio:
+    image: taihb2005/minio:1.0.0
+    container_name: datalake
+    hostname: minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-taihb2005}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-admin@123}
+    volumes:
+      - ${MINIO_HOST_VOLUME:-minio_data}:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - bigdata-common-net
+
+  redis:
+    image: redis:8.2-alpine
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "300 10"
+      - --dir
+      - /data
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - batch-net
+
+  # ============================================================================
+  # 2. Batch Consumer Service (Ingest Kafka -> MinIO Bronze Data Lake)
+  # ============================================================================
+  batch-consumer:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_consumer
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - batch.consumer
+      - --bootstrap-servers
+      - kafka:9094
+      - --topic
+      - ${KAFKA_TOPIC:-events.bronze.lastfm}
+      - --dlq-topic
+      - ${DLQ_TOPIC:-events.bronze.dead-letter}
+      - --group-id
+      - batch-bronze-consumer
+      - --minio-endpoint
+      - minio:9000
+      - --bucket
+      - ${MINIO_DEFAULT_BUCKET:-bronze}
+      - --prefix
+      - events
+      - --flush-interval
+      - ${BATCH_FLUSH_INTERVAL_SECONDS:-60}
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-taihb2005}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-admin@123}
+      BATCH_FLUSH_INTERVAL_SECONDS: ${BATCH_FLUSH_INTERVAL_SECONDS:-60}
+      BATCH_BUFFER_SIZE_BYTES: ${BATCH_BUFFER_SIZE_BYTES:-134217728}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+      DLQ_TOPIC: ${DLQ_TOPIC:-events.bronze.dead-letter}
+    depends_on:
+      kafka:
+        condition: service_started
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  # ============================================================================
+  # 3. Batch Producer Services (Celery Worker, Celery Beat, Topic Init)
+  # ============================================================================
+  kafka-init:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_kafka_init
+    command: ["python", "-m", "batch.producer", "init-topics"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+      DLQ_TOPIC: ${DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC:-events.demo.lastfm}
+    depends_on:
+      kafka:
+        condition: service_started
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  celery-worker:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_celery_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "batch.producer.celery_app:app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    environment:
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+      LASTFM_USERS: ${LASTFM_USERS:-}
+      LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL:-0.4}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+      DLQ_TOPIC: ${DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC:-events.demo.lastfm}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-long-random}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/1}
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  celery-beat:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_celery_beat
+    restart: unless-stopped
+    command: ["celery", "-A", "batch.producer.celery_app:app", "beat", "--loglevel=INFO", "--schedule=/app/output/celerybeat-schedule"]
+    environment:
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+      LASTFM_USERS: ${LASTFM_USERS:-}
+      LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL:-0.4}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-long-random}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/1}
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - batch-net
+
+  app:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    profiles: ["tools"]
+    environment:
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+      LASTFM_USERS: ${LASTFM_USERS:-}
+      LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL:-0.4}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+      DLQ_TOPIC: ${DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC:-events.demo.lastfm}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-long-random}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://:${REDIS_PASSWORD:-change-me-long-random}@redis:6379/1}
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+networks:
+  bigdata-common-net:
+    name: bigdata-common-net
+    driver: bridge
+  batch-net:
+    name: batch-net
+    driver: bridge
+
+volumes:
+  redis_data:
+  minio_data:
