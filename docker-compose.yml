@@ -238,6 +238,8 @@ services:
       - kafka:9094
       - --redis-url
       - redis://redis:6379/0
+      - --max-poll-interval-ms
+      - "1200000"
     env_file:
       - .env
     depends_on:
