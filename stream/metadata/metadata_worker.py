@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-topic", default="metadata.enriched")
     parser.add_argument("--dead-letter-topic", default="metadata.dead-letter")
     parser.add_argument("--group-id", default="lastfm-metadata-worker-v1")
+    parser.add_argument(
+        "--max-poll-interval-ms",
+        type=int,
+        default=1_200_000,
+        help="Thời gian tối đa giữa các lần poll; cần lớn hơn thời gian chờ/retry Last.fm",
+    )
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--max-rate-limit-waits", type=int, default=10,
                         help="Số lần nghỉ vì lỗi 29 trước khi bỏ một yêu cầu vào dead-letter")
@@ -153,6 +159,7 @@ def main() -> None:
         group_id=args.group_id,
         auto_offset_reset="earliest",
         enable_auto_commit=False,
+        max_poll_interval_ms=args.max_poll_interval_ms,
         value_deserializer=lambda value: json.loads(value.decode("utf-8")),
     )
     producer = KafkaProducer(

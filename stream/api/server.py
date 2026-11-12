@@ -4,7 +4,7 @@
   GET /users/<username>/analytics?top=10&recent=10   thống kê của user (Redis)
   GET /users/<username>/trend?n=20                   xu hướng N lượt nghe gần nhất (Redis)
   GET /users/<username>/events?limit=20              scrobble mới nhất (HBase)
-  GET /global/top?kind=tracks|artists&window=5m|15m|1h|6h|24h&k=10[&end=<epoch>]
+  GET /global/top?kind=tracks|artists|albums&window=5m|15m|1h|6h|24h&k=10[&end=<epoch>]
 
 Không có `end` thì "bây giờ" là bucket mới nhất có dữ liệu (đúng khi replay dữ liệu cũ).
 """
@@ -109,8 +109,8 @@ class AnalyticsReader:
         if parts == ["global", "top"]:
             kind = query.get("kind", ["tracks"])[0]
             window = query.get("window", ["1h"])[0]
-            if kind not in {"tracks", "artists"}:
-                raise ApiError(400, "kind phải là tracks hoặc artists")
+            if kind not in {"tracks", "artists", "albums"}:
+                raise ApiError(400, "kind phải là tracks, artists hoặc albums")
             if window not in WINDOWS:
                 raise ApiError(400, f"window phải là một trong {sorted(WINDOWS)}")
             end = _int_param(query, "end", 0, 0, 10**11) or None

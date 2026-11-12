@@ -170,6 +170,8 @@ services:
       - stream/metadata/metadata_worker.py
       - --redis-url
       - redis://redis:6379/0
+      - --max-poll-interval-ms
+      - "1200000"
       - --kafka-bootstrap
       - kafka:9094
       - --api-key
@@ -223,7 +225,7 @@ services:
       - --hbase-host
       - hbase
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8001:8000"
     depends_on:
       redis:
         condition: service_healthy
