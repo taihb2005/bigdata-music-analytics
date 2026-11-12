@@ -238,7 +238,11 @@ def update_global_windows(client, values: dict[str, str]) -> None:
     pipe = client.pipeline(transaction=False)
     for size in BUCKET_SECONDS:
         start = _bucket_start(epoch, size)
-        for kind, member in (("tracks", values["track_member"]), ("artists", values["artist"])):
+        for kind, member in (
+            ("tracks", values["track_member"]),
+            ("artists", values["artist"]),
+            ("albums", values["album_member"]),
+        ):
             if not member:
                 continue
             key = global_bucket_key(size, start, kind)
@@ -259,8 +263,8 @@ def read_global_top(client, kind: str, window: str, end_epoch: int, k: int = 10)
     """Top-K toàn cục trong cửa sổ `window` kết thúc tại end_epoch (theo thời gian sự kiện)."""
     if window not in WINDOWS:
         raise ValueError(f"window phải là một trong {sorted(WINDOWS)}")
-    if kind not in {"tracks", "artists"}:
-        raise ValueError("kind phải là tracks hoặc artists")
+    if kind not in {"tracks", "artists", "albums"}:
+        raise ValueError("kind phải là tracks, artists hoặc albums")
     size, count = WINDOWS[window]
     last = _bucket_start(end_epoch, size)
     keys = [global_bucket_key(size, last - index * BUCKET_SECONDS[size], kind) for index in range(count)]
