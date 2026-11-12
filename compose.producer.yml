@@ -1,0 +1,102 @@
+name: bigdata-producer
+
+x-app: &app
+  image: bigdata-lastfm-producer:local
+  build:
+    context: .
+    dockerfile: Dockerfile.producer
+  environment:
+    LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+    LASTFM_USERS: ${LASTFM_USERS:-}
+    LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL:-0.4}
+    KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+    KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.bronze.lastfm.dlq}
+    KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC:-events.demo.lastfm}
+    CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+    CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+    PRODUCER_OUTPUT_DIR: /app/output
+  volumes:
+    - ./data/producer:/app/output
+
+services:
+  kafka-volume-init:
+    image: apache/kafka:4.4.0
+    user: "0:0"
+    entrypoint: ["chown", "1000:1000", "/var/lib/kafka/data"]
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  kafka:
+    image: apache/kafka:4.4.0
+    ports:
+      - "127.0.0.1:19092:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    volumes:
+      - kafka-data:/tmp/kraft-combined-logs
+    depends_on:
+      kafka-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka-init:
+    <<: *app
+    command: ["python", "-m", "producer", "init-topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["celery", "-A", "producer.celery_app:app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "producer.celery_app:app", "beat", "--loglevel=INFO", "--schedule=/app/output/celerybeat-schedule"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  app:
+    <<: *app
+    profiles: ["tools"]
+
+volumes:
+  kafka-data:
+  redis-data:

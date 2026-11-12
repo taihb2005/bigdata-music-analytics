@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements-producer.txt .
+RUN pip install --no-cache-dir -r requirements-producer.txt
+COPY producer ./producer
+COPY schemas ./schemas
+COPY tests ./tests
+ENV PRODUCER_OUTPUT_DIR=/app/output
+CMD ["python", "-m", "producer", "--help"]

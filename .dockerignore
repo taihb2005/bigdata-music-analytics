@@ -1,0 +1,11 @@
+**
+!Dockerfile.producer
+!requirements-producer.txt
+!producer/
+!producer/**
+!tests/
+!tests/**
+!schemas/
+!schemas/**
+**/__pycache__/
+**/*.pyc

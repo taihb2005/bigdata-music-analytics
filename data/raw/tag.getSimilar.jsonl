@@ -1,0 +1,5 @@
+{"key": "tag.getSimilar|{\"tag\": \"rock\"}", "method": "tag.getSimilar", "params": {"tag": "rock"}, "fetched_at": 1792934663, "response": {"similartags": {"tag": [], "@attr": {"tag": "n/a"}}}}
+{"key": "tag.getSimilar|{\"tag\": \"electronic\"}", "method": "tag.getSimilar", "params": {"tag": "electronic"}, "fetched_at": 1792934690, "response": {"similartags": {"tag": [], "@attr": {"tag": "n/a"}}}}
+{"key": "tag.getSimilar|{\"tag\": \"seen live\"}", "method": "tag.getSimilar", "params": {"tag": "seen live"}, "fetched_at": 1792934693, "response": {"similartags": {"tag": [], "@attr": {"tag": "n/a"}}}}
+{"key": "tag.getSimilar|{\"tag\": \"alternative\"}", "method": "tag.getSimilar", "params": {"tag": "alternative"}, "fetched_at": 1792934694, "response": {"similartags": {"tag": [], "@attr": {"tag": "n/a"}}}}
+{"key": "tag.getSimilar|{\"tag\": \"pop\"}", "method": "tag.getSimilar", "params": {"tag": "pop"}, "fetched_at": 1792934697, "response": {"similartags": {"tag": [], "@attr": {"tag": "n/a"}}}}
