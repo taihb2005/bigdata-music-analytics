@@ -1,12 +1,8 @@
 # Kiến trúc tổng quan và thỏa thuận tích hợp batch – speed
 
-> **Bản nháp, chờ nhóm batch duyệt.** Tài liệu chỉ coi là đã chốt khi PR được merge vào `main`.
->
-> Code `producer/` (nhánh `batch/producer`) và `stream/` (nhánh `realtime-streaming`) **chưa có trên `main`**, nên các link tới code trong tài liệu chỉ mở được sau khi hai nhánh đó được merge.
-
 Cập nhật: 2026-11-13. Tài liệu này mô tả kiến trúc chung của project và những điểm nhóm batch và nhóm speed phải dùng giống nhau.
 
-**Đã chốt:** producer của nhóm batch (`producer/`, nhánh `batch/producer`) là **nguồn dữ liệu vào duy nhất**. Producer cũ của speed (`stream/producer/produce_scrobbles.py`) ngừng dùng cho dữ liệu thật.
+**Đã chốt:** producer của nhóm batch (`batch/producer/`) là **nguồn dữ liệu vào duy nhất**. Producer cũ của speed (`stream/producer/produce_scrobbles.py`) ngừng dùng cho dữ liệu thật. Lưu ý: compose trên `batch-pipeline` vẫn đang bật producer này (mục 6, vấn đề 1).
 
 Mục 6 là các câu hỏi chưa có câu trả lời. Mỗi câu kèm một phương án đề xuất.
 
@@ -27,17 +23,17 @@ flowchart LR
     LF[Last.fm API]
 
     subgraph ING[Ingestion - nhóm batch]
-        BEAT[Celery Beat] --> WK[Celery Worker<br/>lấy scrobble + metadata<br/>chuẩn hóa, kiểm tra schema]
+        BEAT[Celery Beat<br/>phút 0 mỗi giờ] --> WK[Celery Worker<br/>lấy scrobble + metadata<br/>chuẩn hóa, kiểm tra schema]
     end
 
     LF --> WK
-    WK --> K[(Kafka<br/>events.bronze.lastfm<br/>+ .dlq)]
+    WK --> K[(Kafka<br/>events.bronze.lastfm<br/>events.bronze.dead-letter)]
 
     subgraph BATCH[Batch layer - nhóm batch]
-        C[Consumer<br/>micro-batch] --> BR[(MinIO Bronze<br/>JSONL gzip)]
-        BR --> SV[(Silver<br/>fact_listen, dim_*)]
-        SV --> SB[Spark batch]
-        SB --> BV[(Batch view)]
+        C[batch-consumer<br/>micro-batch theo partition] --> BR[(MinIO bucket bronze<br/>events/*.jsonl.gz)]
+        BR -.chưa có.-> SV[(Silver<br/>fact_listen, dim_*)]
+        SV -.chưa có.-> SB[Spark batch]
+        SB -.chưa có.-> BV[(Batch view)]
     end
 
     subgraph SPEED[Speed layer - nhóm speed]
@@ -46,37 +42,50 @@ flowchart LR
     end
 
     K --> C
-    K --> SS
+    K -.cần đổi topic.-> SS
 
     subgraph SERVE[Serving]
         API[API HTTP<br/>ghép batch view + realtime view theo mốc T]
     end
 
-    BV --> API
+    BV -.-> API
     RV --> API
     HB --> API
     API --> UI[Dashboard / demo]
 ```
 
-| Thành phần | Nhóm | Code | Ghi chú |
+Nét đứt là phần chưa làm hoặc phải sửa.
+
+| Thành phần | Nhóm | Code (nhánh `batch-pipeline`) | Trạng thái |
 |---|---|---|---|
-| Producer (Celery Beat + Worker) | batch | `producer/` (nhánh `batch/producer`) | Mỗi giờ lấy trọn giờ trước của từng user |
-| Kafka | chung | một broker duy nhất | Phải gộp hai compose hiện có (mục 3.1) |
-| Consumer → MinIO Bronze | batch | chưa có | Theo đặc tả `docs/batch_pipeline.md` (nhánh `main`) |
-| Silver, Spark batch, batch view | batch | chưa có | Nhóm batch bổ sung mục 4.1 |
-| Spark speed layer, Redis, HBase | speed | `stream/processing/`, `stream/storage/` (nhánh `realtime-streaming`) | Đã chạy với topic cũ `scrobble.raw` |
-| API serving | speed (tạm) | `stream/api/server.py` | Hiện mới đọc dữ liệu của speed |
+| Producer: Celery Beat + Worker | batch | `batch/producer/` | **Có.** Mỗi giờ lấy trọn giờ trước của từng user. |
+| Kafka | chung | `docker/kafka.yml` | **Có.** Một broker cho cả project. |
+| Consumer Kafka → MinIO Bronze | batch | `batch/consumer/`, `batch/datalake/` | **Có.** Mục 2, bước 4. |
+| Silver, Spark batch, batch view | batch | — | **Chưa có.** Nhóm batch bổ sung mục 4.1. |
+| Spark speed layer, Redis, HBase | speed | `stream/processing/`, `stream/storage/` | **Có**, nhưng vẫn đọc topic cũ `scrobble.raw`. |
+| Metadata worker/sink của speed | speed | `stream/metadata/` | Có. Xem lại sau khi đổi sang message của batch (mục 7). |
+| API serving | speed (tạm) | `stream/api/server.py` | Có. Mới đọc dữ liệu của speed. |
+| Hạ tầng | chung | `docker-compose.yml` (gốc) gọi `docker/docker-compose.network.yml`, `docker/kafka.yml`, `batch/docker-compose.yml` | `docker compose config` chạy được, gồm 14 service. |
 
 ---
 
 ## 2. Luồng dữ liệu
 
-1. **Lập lịch.** Celery Beat chạy ở phút 0 mỗi giờ, tạo cho mỗi user một task kèm `trigger_time` (Unix giây, UTC). Worker nhận task trễ hay phải chạy lại thì vẫn dùng đúng mốc này.
-2. **Lấy dữ liệu.** Worker gọi `user.getRecentTracks` cho cửa sổ `[trigger_time − 3600, trigger_time)`. Với mỗi scrobble, worker gọi thêm `track.getInfo`, `artist.getInfo`, `album.getInfo`, rồi gộp thành **một event** và kiểm tra theo JSON Schema.
-3. **Ghi Kafka.** Event hợp lệ vào topic `events.bronze.lastfm`. Event lỗi vào `events.bronze.lastfm.dlq`, kèm lý do. Key là username. Producer bật idempotence và `acks=all`. Bản sao của mỗi lần chạy được lưu ở `data/producer/runs/` để gửi lại khi cần.
-4. **Batch.** Consumer gom message rồi ghi xuống MinIO Bronze. Chỉ khi upload thành công mới commit offset. Từ Bronze, Spark batch tạo Silver (`fact_listen`, các bảng `dim_*`), rồi tính batch view.
-5. **Speed.** Spark Structured Streaming đọc **cùng topic** với một consumer group riêng, cứ 10 giây một micro-batch. Nó khử trùng theo `event_id` bằng Redis, cập nhật realtime view trên Redis, và ghi `fact_listen` gần đây vào HBase.
-6. **Serving.** API đọc batch view cho phần dữ liệu ≤ T, cộng realtime view cho phần > T (mục 5).
+1. **Lập lịch.** Celery Beat chạy ở phút 0 mỗi giờ, tạo cho mỗi user trong `LASTFM_USERS` một task kèm `trigger_time` (Unix giây, UTC). Worker nhận task trễ hay phải chạy lại thì vẫn dùng đúng mốc này.
+2. **Lấy dữ liệu.** Worker gọi `user.getRecentTracks` cho cửa sổ `[trigger_time − 3600, trigger_time)`. Với mỗi scrobble, worker gọi thêm `track.getInfo`, `artist.getInfo`, `album.getInfo`, rồi gộp thành **một event** và kiểm tra theo JSON Schema (`batch/producer/schema.py`).
+3. **Ghi Kafka.**
+   - Event hợp lệ vào topic `events.bronze.lastfm`. Event lỗi vào `events.bronze.dead-letter`, kèm lý do.
+   - Key là username. Producer bật idempotence và `acks=all`.
+   - Bản sao của mỗi lần chạy được lưu ở `data/producer/runs/` để gửi lại khi cần.
+4. **Batch, tầng Bronze** (`batch/consumer/`):
+   - Consumer group `batch-bronze-consumer`, commit offset thủ công.
+   - Gom message theo từng partition thành file JSONL nén gzip. Ghi file khi đủ `BATCH_BUFFER_SIZE_BYTES` (mặc định 128 MB) hoặc hết `BATCH_FLUSH_INTERVAL_SECONDS` (compose đặt 60 giây, code mặc định 1800 giây).
+   - Upload lên MinIO dưới dạng `.tmp`, rồi copy sang tên chính thức và xóa `.tmp`. **Chỉ sau đó** mới commit offset. Đây là at-least-once: có thể có bản ghi trùng, nên tầng Silver phải khử trùng theo `event_id`.
+   - Đường dẫn object: `bronze/events/events_p{partition}_{offset_đầu}_{offset_cuối}_{unix_giây}.jsonl.gz`.
+   - Message sai schema bị đưa vào DLQ. File `.tmp` bị bỏ dở quá 24 giờ thì tự dọn.
+5. **Batch, Silver và batch view:** chưa có (mục 4.1).
+6. **Speed.** Spark Structured Streaming đọc **cùng topic** với nhóm batch, nhưng theo checkpoint riêng, cứ 10 giây một micro-batch. Nó khử trùng theo `event_id` bằng Redis, cập nhật realtime view trên Redis, và ghi `fact_listen` gần đây vào HBase. *Hiện vẫn đọc `scrobble.raw`, phải sửa (mục 7).*
+7. **Serving.** API đọc batch view cho phần dữ liệu trước mốc T, cộng realtime view cho phần từ T trở đi (mục 5).
 
 ---
 
@@ -84,26 +93,27 @@ flowchart LR
 
 ### 3.1. Kafka
 
-| Mục | Giá trị |
+| Mục | Giá trị hiện tại (`batch-pipeline`) |
 |---|---|
-| Broker | **Một** Kafka chung. Trong Docker network dùng `kafka:9092`, từ máy host dùng `localhost:19092` (theo `compose.producer.yml`). |
+| Broker | Một Kafka chung (`docker/kafka.yml`). Trong Docker network dùng `kafka:9094`, từ máy host dùng `localhost:9092`. |
+| Image | `apache/kafka:latest`. **Nên ghim phiên bản** (ví dụ `apache/kafka:4.4.0`), vì `latest` có thể đổi giữa các máy. |
 | Topic chính | `events.bronze.lastfm`, 3 partition |
-| Topic lỗi | `events.bronze.lastfm.dlq` |
+| Topic lỗi | `events.bronze.dead-letter` (biến `DLQ_TOPIC` / `KAFKA_DLQ_TOPIC`) |
 | Topic demo | `events.demo.lastfm` (`source = demo`), không trộn với dữ liệu thật |
 | Key | username Last.fm |
 | Value | một event JSON UTF-8 theo schema mục 3.2 |
-| Consumer group | batch: `batch-bronze-sink`; speed: do Spark tự quản qua checkpoint. Hai nhóm không dùng chung group. |
-| Lưu giữ (retention) | Ít nhất bằng thời gian consumer batch có thể ngừng chạy mà không mất dữ liệu. Đề xuất 7 ngày. |
-
-Kafka bên speed (`docker-compose.yml`, `apache/kafka:3.8.0`, cổng 9092) **sẽ bỏ**. Cả project dùng chung một file compose, hoặc một network chung, với Kafka `apache/kafka:4.4.0` của producer.
+| Consumer | Batch dùng group `batch-bronze-consumer`. Speed do Spark quản offset qua checkpoint. Hai bên độc lập. |
+| Lưu giữ (retention) | Chưa đặt, đang dùng mặc định của Kafka (7 ngày). Đủ nếu consumer batch không ngừng lâu hơn thế. |
 
 ### 3.2. Schema message
 
-Code kiểm tra schema là [`producer/schema.py`](../producer/schema.py) (`schema_version = "1.0"`). Lệnh xuất JSON Schema:
+Code kiểm tra schema là `batch/producer/schema.py` (`schema_version = "1.0"`). Lệnh xuất JSON Schema:
 
 ```powershell
-docker compose -f compose.producer.yml run --rm --no-deps app python -m producer schema
+docker compose run --rm --no-deps app python -m batch.producer schema
 ```
+
+`docs/schemas.md` đang ghi lệnh với `docker/compose.producer.yml`, nhưng file đó không có trên `batch-pipeline`. Cần sửa lại.
 
 | Nhóm trường | Nội dung chính |
 |---|---|
@@ -114,9 +124,12 @@ docker compose -f compose.producer.yml run --rm --no-deps app python -m producer
 | `artist_metadata` | `stats.userplaycount`, `similar.artist[]`, `tags.tag[]`, `bio` |
 | `album_metadata` | `playcount`, `userplaycount`, `tracks.track[]`, `wiki` |
 
-Quy ước: trường mà API không trả về để `null` hoặc danh sách rỗng, **không** tự điền 0. Các số liệu metadata là ảnh chụp tại lúc crawl, không phải giá trị tại lúc nghe.
+Quy ước:
+- Trường mà API không trả về để `null` hoặc danh sách rỗng, **không** tự điền 0.
+- Các số liệu metadata là ảnh chụp tại lúc crawl, không phải giá trị tại lúc nghe.
+- Đổi schema (thêm, bớt hay đổi kiểu trường) thì phải tăng `schema_version` và báo cho cả hai nhóm.
 
-Đổi schema (thêm, bớt hay đổi kiểu trường) thì phải tăng `schema_version` và báo cho cả hai nhóm.
+Consumer batch (`batch/consumer/dlq.py`) hiện chỉ kiểm tra lỏng: có `event_id` và có thông tin user/bài. Nó không kiểm tra theo JSON Schema đầy đủ.
 
 ### 3.3. Khóa
 
@@ -129,13 +142,13 @@ Quy ước: trường mà API không trả về để `null` hoặc danh sách r
 | `album_id` | `"al:" + sha1(artist_norm ␟ album_norm)[:16]` | Consumer |
 
 - `*_norm = normalize_text(tên)`: chuẩn hóa NFKC, casefold, gộp khoảng trắng, giữ dấu tiếng Việt. Ký tự ␟ là `\x1f`.
-- Code tham chiếu là [`stream/common/ids.py`](../stream/common/ids.py) (nhánh `realtime-streaming`). Batch nên **import thẳng file này** hoặc bọc nó thành UDF, không tự viết lại.
+- Code tham chiếu là `stream/common/ids.py`. Batch nên **import thẳng file này** hoặc bọc nó thành UDF, không tự viết lại. Đề xuất chuyển file này ra một thư mục trung lập (ví dụ `common/`) để batch không phụ thuộc vào `stream/`.
 - Các khóa thực thể **không dùng MBID**, vì MBID lúc có lúc không với cùng một bài.
 - Công thức `event_id` cũ của speed (`sha1(user_id, listened_at, track_id)[:32]`) **bỏ**. Từ giờ chỉ dùng `event_id` lấy từ message.
 
 ### 3.4. Thời gian
 
-- Mọi timestamp lưu ở dạng **Unix giây UTC**.
+- Mọi timestamp lưu ở dạng **Unix giây UTC**. Celery cũng đã đặt `timezone="UTC"`.
 - `listened_date`, `hour` tính theo **UTC**. `dow` theo ISO: 1 = Thứ hai … 7 = Chủ nhật.
 - Muốn hiển thị theo giờ Việt Nam thì chuyển ở tầng hiển thị, không chuyển trong dữ liệu.
 
@@ -166,12 +179,17 @@ Hai layer phải ra **cùng một dòng** `fact_listen` (danh sách trường tr
 
 ### 4.1. Batch view (nhóm batch bổ sung)
 
-Cần ghi rõ:
+Hiện `batch-pipeline` mới tới tầng Bronze. Cần ghi rõ:
 
-- Silver lưu ở đâu: Delta hay Iceberg, đường dẫn MinIO, cách phân vùng (đề xuất theo `listened_date`).
-- Batch tính ra những gì: ví dụ thống kê user theo ngày, top bài/nghệ sĩ/album, thói quen theo `dow`/`hour`, gợi ý dài hạn.
-- Batch view lưu ở đâu (đề xuất HBase, bảng riêng tiền tố `batch_`), row key và các cột.
-- Lịch chạy của batch.
+- **Silver:**
+  - Định dạng: Delta hay Iceberg (`docs/batch_pipeline.md` có nhắc cả hai).
+  - Bucket và đường dẫn trên MinIO.
+  - Cách phân vùng: đề xuất theo `listened_date`.
+  - Khử trùng theo `event_id`.
+- **Spark batch đọc Bronze thế nào.** Tên file Bronze chỉ có partition Kafka, offset và thời điểm ghi, **không** chia theo ngày. Nên mỗi lần chạy phải đọc lại toàn bộ, hoặc phải tự lưu danh sách file đã xử lý.
+- **Batch tính ra những gì:** ví dụ thống kê user theo ngày, top bài/nghệ sĩ/album, thói quen theo `dow`/`hour`, gợi ý dài hạn.
+- **Batch view lưu ở đâu:** đề xuất HBase, bảng riêng có tiền tố `batch_`. Kèm row key và các cột.
+- **Lịch chạy** của batch.
 
 ### 4.2. Realtime view (speed, đã có)
 
@@ -207,11 +225,14 @@ Cần ghi rõ:
 
 | # | Vấn đề | Đề xuất |
 |---|---|---|
-| 1 | **Độ trễ của speed thành 1–2 giờ.** Producer chỉ lấy trọn giờ trước nó, nên một lượt nghe lúc 07:05 phải đến khoảng 08:00 mới vào Kafka. Như vậy speed không còn gần realtime. | Cho producer chạy theo cửa sổ ngắn hơn (ví dụ 5 phút). Phải sửa `producer/window.py` (hiện bắt buộc tròn giờ) và lịch trong `celery_app.py`. Nếu nhóm chấp nhận trễ theo giờ thì ghi rõ trong báo cáo. |
-| 2 | **Scrobble đến muộn bị bỏ sót.** Last.fm nhận scrobble muộn (nghe offline, client gửi sau), mà cửa sổ đã đóng thì không bao giờ lấy lại. | Mỗi lần chạy lấy chồng lên cửa sổ trước (ví dụ thêm 1 giờ về trước). Trùng lặp thì khử bằng `event_id` ở cả hai layer. |
-| 3 | **Số request Last.fm.** Mỗi scrobble tốn khoảng 3 request metadata, kèm username, và cache chỉ sống trong một job. Với 406 user và 1 worker ở mức 0,4 giây/request, một vòng có thể không xong trong một giờ. | Gọi metadata **không kèm username** (dùng chung giữa các user), cache giữa các job (Redis), mặc định không lưu `wiki`/`bio`/danh sách bài của album. Cần đo thực tế với đủ số user. |
-| 4 | **Redis.** Celery dùng Redis làm broker (db 0, 1); speed dùng Redis cho realtime view với `maxmemory` + `noeviction`. | Tách hai instance Redis. Nếu dùng chung thì dùng db khác nhau, nhưng giới hạn bộ nhớ áp lên cả instance. |
-| 5 | **Gợi ý bài nghe tiếp** chưa làm. | Speed dùng `artist_metadata.similar` có sẵn trong message cộng với `track.getSimilar` (cache dùng chung); batch cung cấp gu dài hạn để xếp hạng lại. |
+| 1 | **Vẫn có hai producer.** `docker-compose.yml` gốc vẫn bật `scrobble-producer` (topic `scrobble.raw`) cạnh Celery worker. Cả hai cùng gọi Last.fm, nên dễ vượt giới hạn và bị lỗi 29. | Bỏ `scrobble-producer` khỏi compose, hoặc đưa vào profile `tools` để chỉ dùng khi replay hay demo. Đồng thời đổi topic của speed (mục 7). |
+| 2 | **Redis dùng chung db 0.** Sau khi gộp compose chỉ còn một Redis. Celery dùng db 0 (broker) và db 1 (kết quả). Speed cũng dùng `redis://redis:6379/0`, với `maxmemory 512mb` + `noeviction`. Hàng đợi Celery và realtime view cùng nằm trong db 0, cùng chịu một giới hạn bộ nhớ. | Đổi speed sang db 2, hoặc tách hai instance Redis (một cho Celery, một cho realtime view). Tôi khuyên tách hai instance: Redis đầy thì speed báo lỗi ghi, nhưng Celery không bị kẹt theo. |
+| 3 | **Độ trễ của speed thành 1–2 giờ.** Producer chỉ lấy trọn giờ trước nó, nên một lượt nghe lúc 07:05 phải đến khoảng 08:00 mới vào Kafka. Như vậy speed không còn gần realtime. | Cho producer chạy theo cửa sổ ngắn hơn (ví dụ 5 phút). Phải sửa `batch/producer/window.py` (hiện bắt buộc tròn giờ) và lịch trong `celery_app.py`. Nếu nhóm chấp nhận trễ theo giờ thì ghi rõ trong báo cáo. |
+| 4 | **Scrobble đến muộn bị bỏ sót.** Last.fm nhận scrobble muộn (nghe offline, client gửi sau), mà cửa sổ đã đóng thì không bao giờ lấy lại. | Mỗi lần chạy lấy chồng lên cửa sổ trước (ví dụ thêm 1 giờ về trước). Trùng lặp thì khử bằng `event_id` ở cả hai layer. |
+| 5 | **Số request Last.fm.** Mỗi scrobble tốn khoảng 3 request metadata, kèm username, và cache chỉ sống trong một job. Với 406 user và 1 worker (`--concurrency=1`) ở mức 0,4 giây/request, một vòng có thể không xong trong một giờ. | Gọi metadata **không kèm username** (dùng chung giữa các user), cache giữa các job (Redis), mặc định không lưu `wiki`/`bio`/danh sách bài của album. Cần đo thực tế với đủ số user. |
+| 6 | **File Bronze nhỏ.** Compose đặt `BATCH_FLUSH_INTERVAL_SECONDS=60`. Lượng dữ liệu theo giờ ít, nên mỗi phút một file chỉ vài KB, trái với mục tiêu 128–256 MB trong `docs/batch_pipeline.md`. | Để mặc định 1800 giây hoặc lâu hơn khi chạy thật. Dùng 60 giây chỉ cho demo. |
+| 7 | **Cấu hình chưa ghim:** Kafka `apache/kafka:latest`, và MinIO dùng image cá nhân `taihb2005/minio:1.0.0` với mật khẩu mặc định ghi sẵn trong compose. | Ghim phiên bản Kafka. Dùng image chính thức `minio/minio`. Bắt buộc đặt mật khẩu trong `.env`, không để mặc định. |
+| 8 | **Gợi ý bài nghe tiếp** chưa làm. | Speed dùng `artist_metadata.similar` có sẵn trong message cộng với `track.getSimilar` (cache dùng chung). Batch cung cấp gu dài hạn để xếp hạng lại. |
 
 ---
 
@@ -219,21 +240,21 @@ Cần ghi rõ:
 
 ### Nhóm speed
 
-- Spark đọc `events.bronze.lastfm` thay cho `scrobble.raw`. Tạo checkpoint mới.
+- Spark đọc `events.bronze.lastfm` thay cho `scrobble.raw`. Bootstrap là `kafka:9094`. Tạo checkpoint mới.
 - Đọc user từ `user_profile.name`. Khử trùng theo `event_id` của message. Lấy `duration_ms` và `tags` từ message (mục 3.5).
 - Sửa `stream/common/fact_listen.py` theo mục 3.5. Bỏ công thức `event_id` cũ trong `ids.py`.
-- Ngừng `produce_scrobbles.py`. Xem lại metadata worker/sink: chỉ giữ nếu còn cần dữ liệu mà message không có.
+- Bỏ `scrobble-producer` khỏi compose. Xem lại metadata worker/sink: chỉ giữ nếu còn cần dữ liệu mà message không có.
+- Đổi db Redis hoặc tách instance (mục 6, vấn đề 2).
 - Sửa công cụ replay và tạo dữ liệu mẫu để ra đúng schema mới.
 - API đọc mốc T và ghép với batch view (mục 5).
 
 ### Nhóm batch
 
-- Consumer Kafka → MinIO Bronze.
-- Silver theo mục 3.3–3.5, dùng chung `ids.py`.
-- Bổ sung mục 4.1. Ghi mốc T theo mục 5.
-- Trả lời các vấn đề 1–3 ở mục 6.
+- Silver, Spark batch và batch view (mục 4.1). Dùng chung `ids.py`.
+- Ghi mốc T theo mục 5.
+- Trả lời các vấn đề 3–7 ở mục 6. Sửa lệnh trong `docs/schemas.md`.
 
 ### Chung
 
-- Gộp hạ tầng về một compose hoặc một network: một Kafka, MinIO, HBase, Redis.
+- Merge `batch-pipeline` vào `main`.
 - Một message mẫu (đã bỏ thông tin cá nhân) và một test ánh xạ `fact_listen` dùng chung cho cả hai nhóm.
