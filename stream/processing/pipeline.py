@@ -1,6 +1,8 @@
 """Lõi xử lý scrobble của speed layer, tách khỏi Spark để test được bằng đối tượng giả.
 
-Spark chỉ đọc Kafka rồi gọi process_events cho từng partition. Mọi nghiệp vụ nằm ở đây:
+Spark chỉ đọc Kafka rồi gọi process_events cho từng partition. Đầu vào là message của producer batch
+(topic events.bronze.lastfm, xem stream/common/bronze_event.py); event định dạng cũ vẫn chạy được.
+Message batch đã kèm metadata nên không gửi metadata.request cho chúng. Mọi nghiệp vụ nằm ở đây:
   - ghi event thô và dòng phẳng fact_listen vào HBase (idempotent theo row key),
   - khử trùng bằng Redis (SET NX trong Lua) rồi cập nhật thống kê theo user và theo cửa sổ,
   - kiểm tra metadata còn thiếu và gửi yêu cầu (có khóa chống gửi trùng); chỉ cho event có `source`
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from stream.common.bronze_event import adapt_event, embedded_duration_ms, is_bronze_event
 from stream.common.metadata_common import build_metadata_requests, metadata_cache_key
 from stream.processing.realtime_store import (
     analytics_values,
@@ -39,19 +42,30 @@ class PipelineConfig:
     per_user_stats: bool = False
     global_windows: bool = True
     metadata_sources: tuple[str, ...] = ("lastfm",)  # rỗng = mọi nguồn
+    # Message batch đã kèm metadata: dùng luôn, không gửi metadata.request (không tốn request Last.fm).
+    use_embedded_metadata: bool = True
 
 
 PENDING_TTL = 7 * 86400
 
 
 def event_delay_seconds(event: dict[str, Any]) -> int:
-    """Độ trễ giữa lúc nghe và lúc producer tiếp nhận event."""
+    """Độ trễ của event, dùng để đánh dấu "đến muộn".
+
+    Event cũ của speed: từ lúc nghe đến lúc producer nhận (`ingested_at − uts`).
+    Message batch: từ lúc cửa sổ của producer đóng (`trigger_time`) đến lúc producer gửi. Producer batch
+    lấy trọn giờ trước, nên `ingested_at − uts` luôn tới 1 giờ dù không có gì bất thường; đo từ
+    `trigger_time` mới cho thấy job bị chậm thật.
+    """
     try:
-        played_at = int(event["scrobble_event"]["date"]["uts"])
         ingested_at = datetime.fromisoformat(str(event["ingested_at"]).replace("Z", "+00:00"))
         if ingested_at.tzinfo is None:
             ingested_at = ingested_at.replace(tzinfo=timezone.utc)
-        return max(0, int(ingested_at.timestamp()) - played_at)
+        if is_bronze_event(event) and event.get("trigger_time") is not None:
+            reference = int(event["trigger_time"])
+        else:
+            reference = int(event["scrobble_event"]["date"]["uts"])
+        return max(0, int(ingested_at.timestamp()) - reference)
     except (KeyError, TypeError, ValueError, OSError):
         return 0
 
@@ -85,13 +99,14 @@ def process_events(
     đúng lúc event vừa vào danh sách chờ (xem bên dưới). None thì bỏ bước đó.
     """
     stats: Counter[str] = Counter(
-        {name: 0 for name in ("events", "new", "duplicates", "late", "metadata_requests", "metadata_skipped")}
+        {name: 0 for name in ("events", "new", "duplicates", "late", "metadata_requests", "metadata_skipped",
+                              "metadata_embedded")}
     )
     producer = None
     touched: dict[tuple[str, str], list[str]] = {}
     try:
         for event in events:
-            event = dict(event)
+            event = adapt_event(event)
             event.pop("event_time", None)
             stats["events"] += 1
 
@@ -106,8 +121,13 @@ def process_events(
             track_request = None
             track_duration = None
             track_is_pending = False
+            embedded = cfg.use_embedded_metadata and is_bronze_event(event)
             wants_metadata = not cfg.metadata_sources or str(event.get("source", "")) in cfg.metadata_sources
-            if not wants_metadata:
+            if embedded:
+                wants_metadata = False
+                track_duration = str(embedded_duration_ms(event) or 0)
+                stats["metadata_embedded"] += 1
+            elif not wants_metadata:
                 stats["metadata_skipped"] += 1
             requests = build_metadata_requests(event, per_user_stats=cfg.per_user_stats) if wants_metadata else []
             for request in requests:

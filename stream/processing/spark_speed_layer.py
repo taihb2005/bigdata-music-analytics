@@ -1,4 +1,8 @@
-"""Speed layer: Kafka (scrobble.raw) -> Spark Structured Streaming -> HBase (serving) + Redis (trạng thái nóng).
+"""Speed layer: Kafka (events.bronze.lastfm) -> Spark Structured Streaming -> HBase (serving) + Redis (trạng thái nóng).
+
+Đọc message của producer batch (schema: batch/producer/schema.py, hợp đồng: docs/architecture.md mục 3).
+Message batch không có `user`/`event_type`: Spark lấy `user` từ `user_profile.name` và mặc định
+`event_type = "scrobble"`, nên phần xử lý phía sau dùng chung được cho cả event định dạng cũ.
 
 Spark chỉ đọc Kafka theo micro-batch rồi gọi stream.processing.pipeline.process_events cho từng
 partition. KHÔNG có watermark hay cửa sổ stateful của Spark: khử trùng làm bằng Redis (SET NX), còn
@@ -16,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from stream.common.bronze_event import BRONZE_TOPIC, DEMO_TOPIC
 from stream.common.lastfm_client import load_dotenv
 from stream.common.metadata_common import encode_message
 from stream.processing.pipeline import (  # noqa: F401  (re-export cho test và công cụ khác)
@@ -36,15 +41,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     )
-    parser.add_argument("--topic", default="scrobble.raw")
+    parser.add_argument("--topic", default=os.getenv("KAFKA_TOPIC", BRONZE_TOPIC),
+                        help=f"một hoặc nhiều topic, cách nhau bằng dấu phẩy (vd: {BRONZE_TOPIC},{DEMO_TOPIC})")
     parser.add_argument("--metadata-request-topic", default="metadata.request")
     parser.add_argument("--starting-offsets", choices=["earliest", "latest"], default="earliest")
     parser.add_argument("--max-offsets-per-trigger", type=int, default=2000)
-    parser.add_argument("--late-after-seconds", type=int, default=1800)
+    parser.add_argument("--late-after-seconds", type=int, default=1800,
+                        help="Message batch: tính từ trigger_time (cửa sổ đóng); event cũ: tính từ lúc nghe")
     parser.add_argument("--trigger", default="10 seconds")
     parser.add_argument(
         "--checkpoint",
-        default=str(PROJECT_ROOT / "dataset" / "state" / "spark-speed-layer-v4"),
+        # v5: đổi topic sang events.bronze.lastfm, không dùng lại offset của scrobble.raw.
+        default=str(PROJECT_ROOT / "dataset" / "state" / "spark-speed-layer-v5"),
     )
     parser.add_argument("--hbase-host", default=os.getenv("HBASE_HOST", "localhost"))
     parser.add_argument("--hbase-port", type=int, default=int(os.getenv("HBASE_THRIFT_PORT", "9090")))
@@ -99,26 +107,96 @@ def find_offset_regressions(saved: dict[int, int], end_offsets: dict[int, int]) 
     ]
 
 
+def topic_list(value: str) -> list[str]:
+    """`--topic` nhận một hoặc nhiều topic cách nhau bằng dấu phẩy (như option subscribe của Spark)."""
+    return [name.strip() for name in str(value).split(",") if name.strip()]
+
+
 def guard_checkpoint(args) -> None:
     """Dừng nếu checkpoint không khớp topic hiện tại, thay vì lặng lẽ bỏ qua message."""
-    saved = checkpoint_offsets(args.checkpoint, args.topic)
-    if not saved or args.allow_offset_regression:
+    if args.allow_offset_regression:
+        return
+    checks = [(topic, checkpoint_offsets(args.checkpoint, topic)) for topic in topic_list(args.topic)]
+    checks = [(topic, saved) for topic, saved in checks if saved]
+    if not checks:
         return
     from kafka import KafkaConsumer, TopicPartition
 
     consumer = KafkaConsumer(bootstrap_servers=args.bootstrap_servers)
     try:
-        partitions = [TopicPartition(args.topic, p) for p in (consumer.partitions_for_topic(args.topic) or [])]
-        end = {tp.partition: offset for tp, offset in consumer.end_offsets(partitions).items()}
+        for topic, saved in checks:
+            partitions = [TopicPartition(topic, p) for p in (consumer.partitions_for_topic(topic) or [])]
+            end = {tp.partition: offset for tp, offset in consumer.end_offsets(partitions).items()}
+            regressions = find_offset_regressions(saved, end)
+            if regressions:
+                detail = ", ".join(f"p{p}: checkpoint {c} > kafka {k}" for p, c, k in regressions)
+                raise SystemExit(
+                    f"Checkpoint {args.checkpoint} đi trước topic {topic} ({detail}). Topic đã bị tạo lại nên "
+                    "Spark sẽ bỏ qua message mới. Dùng --checkpoint mới (hoặc đổi tên thư mục checkpoint cũ) "
+                    "rồi chạy lại."
+                )
     finally:
         consumer.close()
-    regressions = find_offset_regressions(saved, end)
-    if regressions:
-        detail = ", ".join(f"p{p}: checkpoint {c} > kafka {k}" for p, c, k in regressions)
-        raise SystemExit(
-            f"Checkpoint {args.checkpoint} đi trước topic {args.topic} ({detail}). Topic đã bị tạo lại nên "
-            "Spark sẽ bỏ qua message mới. Dùng --checkpoint mới (hoặc đổi tên thư mục checkpoint cũ) rồi chạy lại."
-        )
+
+
+def bronze_event_schema():
+    """Schema Spark cho message batch (batch/producer/schema.py), chỉ gồm các trường speed dùng.
+
+    Kiểu phải khớp JSON thật, vì from_json gặp trường sai kiểu thì trả null (có thể cho cả dòng):
+    schema_version là chuỗi "1.0"; image là mảng object; số liệu metadata là chuỗi.
+    Các trường `user`, `event_type`, `url`, `now_playing` chỉ có ở event định dạng cũ.
+    """
+    from pyspark.sql.types import (
+        ArrayType,
+        BooleanType,
+        LongType,
+        MapType,
+        StringType,
+        StructField,
+        StructType,
+    )
+
+    named_entity = StructType([StructField("name", StringType()), StructField("mbid", StringType())])
+    tag_list = StructType([StructField("tag", ArrayType(StructType([StructField("name", StringType())])))])
+    return StructType(
+        [
+            StructField("schema_version", StringType()),
+            StructField("event_id", StringType()),
+            StructField("event_type", StringType()),
+            StructField("source", StringType()),
+            StructField("user", StringType()),
+            StructField("trigger_time", LongType()),
+            StructField("ingested_at", StringType()),
+            StructField(
+                "scrobble_event",
+                StructType(
+                    [
+                        StructField("name", StringType()),
+                        StructField("mbid", StringType()),
+                        StructField("loved", StringType()),
+                        StructField(
+                            "date",
+                            StructType([StructField("uts", StringType()), StructField("text", StringType())]),
+                        ),
+                        StructField("image", ArrayType(MapType(StringType(), StringType()))),
+                        StructField("artist", named_entity),
+                        StructField("album", named_entity),
+                        StructField("url", StringType()),
+                        StructField("now_playing", BooleanType()),
+                    ]
+                ),
+            ),
+            StructField(
+                "user_profile",
+                StructType([StructField("name", StringType()), StructField("country", StringType())]),
+            ),
+            StructField(
+                "track_metadata",
+                StructType([StructField("duration", StringType()), StructField("toptags", tag_list)]),
+            ),
+            StructField("artist_metadata", StructType([StructField("tags", tag_list)])),
+        ]
+    )
 
 
 def main() -> None:
@@ -126,15 +204,7 @@ def main() -> None:
     args = parse_args()
     from kafka import KafkaProducer
     from pyspark.sql import SparkSession
-    from pyspark.sql.functions import col, from_json
-    from pyspark.sql.types import (
-        ArrayType,
-        BooleanType,
-        IntegerType,
-        StringType,
-        StructField,
-        StructType,
-    )
+    from pyspark.sql.functions import coalesce, col, from_json, lit
     from redis import Redis
 
     cfg = PipelineConfig(
@@ -157,47 +227,14 @@ def main() -> None:
     bootstrap_store.ensure_tables()
     bootstrap_store.close()
 
-    named_entity = StructType(
-        [StructField("name", StringType()), StructField("mbid", StringType())]
-    )
-    event_schema = StructType(
-        [
-            StructField("schema_version", IntegerType()),
-            StructField("event_id", StringType()),
-            StructField("event_type", StringType()),
-            StructField("source", StringType()),
-            StructField("user", StringType()),
-            StructField("ingested_at", StringType()),
-            StructField(
-                "scrobble_event",
-                StructType(
-                    [
-                        StructField("name", StringType()),
-                        StructField("mbid", StringType()),
-                        StructField("loved", StringType()),
-                        StructField(
-                            "date",
-                            StructType(
-                                [StructField("uts", StringType()), StructField("text", StringType())]
-                            ),
-                        ),
-                        StructField("image", ArrayType(StringType())),
-                        StructField("artist", named_entity),
-                        StructField("album", named_entity),
-                        StructField("url", StringType()),
-                        StructField("now_playing", BooleanType()),
-                    ]
-                ),
-            ),
-        ]
-    )
+    event_schema = bronze_event_schema()
 
     spark = SparkSession.builder.appName("lastfm-speed-layer").getOrCreate()
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     reader = (
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", args.bootstrap_servers)
-        .option("subscribe", args.topic)
+        .option("subscribe", ",".join(topic_list(args.topic)))
         .option("startingOffsets", args.starting_offsets)
         .option("failOnDataLoss", "true")
     )
@@ -211,6 +248,9 @@ def main() -> None:
             col("offset").alias("kafka_offset"),
         )
         .select("event.*", "kafka_partition", "kafka_offset")
+        # Message batch không có hai trường này; event định dạng cũ thì có sẵn.
+        .withColumn("user", coalesce(col("user"), col("user_profile.name")))
+        .withColumn("event_type", coalesce(col("event_type"), lit("scrobble")))
         .filter(
             (col("event_id").isNotNull())
             & (col("user").isNotNull())

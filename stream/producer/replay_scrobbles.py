@@ -2,6 +2,9 @@
 
 Khác poll thật: không gọi Last.fm nên không bị giới hạn tốc độ API.
 
+Topic mặc định: events.demo.lastfm. Spark speed layer đọc cả topic này, còn batch consumer thì không,
+nên dữ liệu giả không lẫn vào tầng Bronze của batch. Định dạng event vẫn là định dạng cũ của speed.
+
 Thời gian:
   - Mặc định giữ nguyên `date.uts` và `ingested_at` trong file (bộ sinh dữ liệu đã đặt độ trễ scrobble
     30–400 giây). Bản trước đặt ingested_at = lúc gửi, nên với log 14 ngày MỌI event đều bị coi là đến muộn.
@@ -30,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+from stream.common.bronze_event import DEMO_TOPIC  # noqa: E402
 from stream.common.ids import make_event_id, make_track_id, normalize_text  # noqa: E402
 
 
@@ -81,18 +85,23 @@ def iter_events(path: Path, limit: int = 0) -> Iterator[dict]:
                 yield json.loads(line)
 
 
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", type=Path, default=PROJECT_ROOT / "dataset" / "sample" / "scrobbles.jsonl")
     parser.add_argument("--bootstrap-servers", default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
-    parser.add_argument("--topic", default=os.getenv("KAFKA_TOPIC", "scrobble.raw"))
+    # Không lấy KAFKA_TOPIC từ .env: biến đó là topic thật của batch, ghi dữ liệu giả vào đó sẽ lẫn vào Bronze.
+    parser.add_argument("--topic", default=DEMO_TOPIC)
     parser.add_argument("--rate", type=float, default=50.0, help="event/giây (0 = nhanh nhất có thể)")
     parser.add_argument("--limit", type=int, default=0, help="chỉ gửi N event đầu (0 = tất cả)")
     parser.add_argument("--shift-to-now", action="store_true",
                         help="dời cả log để event cuối rơi vào hiện tại (tính lại event_id)")
     parser.add_argument("--source", default="replay",
                         help="giá trị trường source (mặc định replay: không gọi metadata); rỗng = giữ nguyên")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
     offset = shift_to_now_offset(args.file, limit=args.limit) if args.shift_to_now else 0
     if offset:
         print(f"Dời log {offset / 86400:.2f} ngày để event cuối rơi vào hiện tại")

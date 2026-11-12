@@ -85,7 +85,10 @@ services:
     networks:
       - data-net
 
+  # Producer cũ của speed (topic scrobble.raw). Đã chốt dùng producer batch làm nguồn duy nhất
+  # (docs/architecture.md), nên chỉ bật khi cần: docker compose --profile legacy up scrobble-producer
   scrobble-producer:
+    profiles: ["legacy"]
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
@@ -135,6 +138,9 @@ services:
       - /opt/app/stream/processing/spark_speed_layer.py
       - --bootstrap-servers
       - kafka:9094
+      # Topic thật của producer batch + topic demo (replay, producer batch chế độ --demo).
+      - --topic
+      - events.bronze.lastfm,events.demo.lastfm
       - --starting-offsets
       - earliest
       - --max-offsets-per-trigger
@@ -144,7 +150,7 @@ services:
       - --redis-url
       - redis://redis:6379/0
       - --checkpoint
-      - /opt/app/dataset/state/spark-speed-layer-v4
+      - /opt/app/dataset/state/spark-speed-layer-v5
     volumes:
       - .:/opt/app
     environment:
@@ -154,6 +160,9 @@ services:
       redis:
         condition: service_healthy
       stream-init:
+        condition: service_completed_successfully
+      # Topic events.bronze.lastfm do kafka-init của batch tạo (batch/docker-compose.yml).
+      kafka-init:
         condition: service_completed_successfully
     restart: unless-stopped
     mem_limit: 3g
@@ -178,6 +187,9 @@ services:
       - ${LASTFM_API_KEY}
       - --max-rps
       - ${LASTFM_MAX_RPS:-1.0}
+    # REDIS_PASSWORD lấy từ .env (Redis bật requirepass); thiếu dòng này worker không kết nối được Redis.
+    env_file:
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -202,6 +214,8 @@ services:
       - hbase
       - --redis-url
       - redis://redis:6379/0
+    env_file:
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -226,6 +240,8 @@ services:
       - hbase
     ports:
       - "127.0.0.1:8001:8000"
+    env_file:
+      - .env
     depends_on:
       redis:
         condition: service_healthy
@@ -236,29 +252,29 @@ services:
     networks:
       - data-net
 
+  # Phát lại log giả để demo và đo tải (không gọi Last.fm). Ghi vào events.demo.lastfm: Spark đọc topic
+  # này, batch consumer thì không, nên dữ liệu giả không lẫn vào Bronze.
+  #   python -m stream.tools.gen_sample_events        (tạo dataset/sample/scrobbles.jsonl)
+  #   docker compose --profile replay run --rm replay
   replay:
+    profiles: ["replay"]
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
-    container_name: scrobble_replay
-    profiles: ["tools"]
     command:
       - python
-      - stream/producer/produce_scrobbles.py
+      - stream/producer/replay_scrobbles.py
       - --bootstrap-servers
       - kafka:9094
-      - --redis-url
-      - redis://redis:6379/0
-      - --statuses
-      - A
-      - --replay-from-beginning
-      - --min-interval
-      - "0.1"
-      - --max-interval
-      - "0.5"
+      - --topic
+      - events.demo.lastfm
+      - --file
+      - /app/dataset/sample/scrobbles.jsonl
+      - --rate
+      - ${REPLAY_RATE:-50}
+    volumes:
+      - ./dataset/sample:/app/dataset/sample:ro
     depends_on:
-      redis:
-        condition: service_healthy
       stream-init:
         condition: service_completed_successfully
     restart: "no"

@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from stream.common.bronze_event import event_username
 from stream.common.ids import user_key
 
 # Tiền tố v2: thành viên của các ZSET đã đổi từ "tên bài" sang "nghệ sĩ - bài" nên không trộn
@@ -121,8 +122,9 @@ def analytics_values(
         played_at = datetime.fromtimestamp(int(uts), timezone.utc)
     except (TypeError, ValueError, OSError):
         played_at = datetime.now(timezone.utc)
+    # `or {}`: hàng Spark có thể mang khóa với giá trị None (trường có trong schema nhưng message không có).
     duration = (
-        event.get("track_metadata", {}).get("duration", "0")
+        (event.get("track_metadata") or {}).get("duration") or "0"
         if duration_ms is None
         else duration_ms
     )
@@ -130,7 +132,7 @@ def analytics_values(
     artist_name = str(artist.get("name", ""))
     album_name = str(album.get("name", ""))
     return {
-        "username": user_key(event.get("user") or event.get("user_profile", {}).get("name", "")),
+        "username": user_key(event_username(event)),
         "event_id": str(event.get("event_id", "")),
         "played_at": played_at.isoformat(),
         "played_epoch": str(int(played_at.timestamp())),

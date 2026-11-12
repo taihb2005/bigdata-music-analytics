@@ -1,40 +1,45 @@
 # Big Data Music Analytics: phần stream
 
-Phân tích xu hướng nghe nhạc từ Last.fm theo kiến trúc Lambda. Thư mục này là **speed layer**:
+Phân tích xu hướng nghe nhạc từ Last.fm theo kiến trúc Lambda. Tài liệu này nói về phần **speed layer** (`stream/`). Kiến trúc chung và hợp đồng dữ liệu giữa hai nhóm: `docs/architecture.md`.
 
 ```text
-Last.fm ── producer (poll theo lịch, có giới hạn tốc độ) ──► Kafka scrobble.raw
-                                                                  │
-                                            Spark Structured Streaming (đọc Kafka)
-                                                                  │  process_events()
-              ┌───────────────────────────────┬───────────────────┴──────────────────┐
-              ▼                               ▼                                      ▼
-   HBase: event thô, fact_listen,     Redis: khử trùng event_id,          Kafka metadata.request
-   snapshot theo user/ngày            thống kê theo user, top-K toàn      → worker → metadata.enriched
-   (tầng serving)                     cục theo cửa sổ 5 phút/1 giờ        / metadata.dead-letter → sink → HBase + Redis
-                                                                  │
-                                                         API HTTP (đọc Redis + HBase)
+Last.fm ── producer batch (Celery, mỗi giờ) ──► Kafka events.bronze.lastfm ──► batch consumer → MinIO Bronze
+                                                        │
+                       replay (dữ liệu giả) ──► Kafka events.demo.lastfm
+                                                        │
+                                Spark Structured Streaming (đọc cả hai topic)
+                                                        │  process_events()
+              ┌─────────────────────────────────────────┴───────────────┐
+              ▼                                                         ▼
+   HBase: event thô, fact_listen,                        Redis: khử trùng event_id,
+   snapshot theo user/ngày (tầng serving)                thống kê theo user, top-K 5 phút/1 giờ
+                                                        │
+                                               API HTTP (đọc Redis + HBase)
 ```
+
+Message của producer batch đã kèm metadata (thời lượng bài, tag), nên speed **không gọi Last.fm** cho chúng. Metadata worker/sink chỉ còn phục vụ event định dạng cũ.
 
 Chi tiết từng bước: `docs/stream-flow.md`. Các thay đổi so với bản trước: `docs/CHANGES.md`.
 
 ## Chạy
 
 ```bash
-cp .env.example .env     # điền LASTFM_API_KEY và REDIS_PASSWORD (bắt buộc)
+cp .env.example .env     # điền LASTFM_API_KEY, LASTFM_USERS, REDIS_PASSWORD, MINIO_* (bắt buộc)
 docker compose up -d --build
-docker compose logs -f scrobble-producer spark-speed-layer
+docker compose logs -f celery-worker spark-speed-layer
 ```
 
-Mọi cổng chỉ nghe ở `127.0.0.1`. Redis lấy mật khẩu từ `.env` nên **không còn file `redis.conf` phải tạo tay**. Máy cần khoảng 8 GB RAM trống cho Docker (giới hạn trong compose: Kafka 1 GB, HBase 2 GB, Spark 3 GB, Redis 0,7 GB).
+Redis lấy mật khẩu từ `.env` nên **không còn file `redis.conf` phải tạo tay**. Máy cần khoảng 8 GB RAM trống cho Docker (giới hạn trong compose: HBase 2 GB, Spark 3 GB, Redis 0,7 GB; Kafka và MinIO chưa đặt giới hạn).
 
-| Dịch vụ | Cổng (localhost) |
-|---|---|
-| Kafka | 9092 |
-| HBase Master, Thrift, REST | 16010, 9090, 8080 |
-| Redis | 6379 (cần mật khẩu) |
-| API | 8001 (host) → 8000 (container) |
-| MinIO (chỉ khi `--profile batch`) | 9000, 9001 |
+| Dịch vụ | Cổng | Nghe ở |
+|---|---|---|
+| Kafka | 9092 | **mọi địa chỉ** (`docker/kafka.yml`) |
+| MinIO API, Console | 9000, 9001 | **mọi địa chỉ** (`batch/docker-compose.yml`) |
+| Redis | 6379 (cần mật khẩu) | **mọi địa chỉ** (khai báo trong `batch/docker-compose.yml`) và `127.0.0.1` |
+| HBase Master, Thrift, REST | 16010, 9090, 8080 | `127.0.0.1` |
+| API | 8001 (host) → 8000 (container) | `127.0.0.1` |
+
+Kafka, HBase Thrift và API không có xác thực. Kafka, MinIO và Redis đang mở ra mọi địa chỉ của máy, nên nếu máy nối mạng chung (wifi trường, quán cà phê) thì người khác có thể truy cập. Nên đổi về `127.0.0.1` (vấn đề 7 ở mục 6 của `docs/architecture.md`).
 
 ## Giới hạn tốc độ và dung lượng của Last.fm (đọc trước khi chạy 500 user)
 
@@ -45,7 +50,9 @@ Mọi cổng chỉ nghe ở `127.0.0.1`. Redis lấy mật khẩu từ `.env` n�
 
 ## Producer
 
-`stream/producer/produce_scrobbles.py` poll theo lịch từng user, chỉ lấy scrobble mới bằng tham số `from` (không lấy lại 50 bài gần nhất mỗi lần), gọi `user.getRecentTracks` với `extended=1` (để có `loved`). Lần chạy đầu chỉ lấy scrobble trong `--backfill-minutes` (mặc định 10) phút gần nhất, không đẩy ~25.000 event cũ. Nếu user có nhiều hơn `--max-pages` trang bài mới (ví dụ producer tắt lâu), producer lấy các trang **cũ nhất** trước và đọc tiếp ở lần poll sau, nên không bỏ sót bài nào. Checkpoint (event đã gửi và `last_uts`) nằm ở `dataset/state/<user>_seen.json`.
+Producer chính là **producer batch** (`batch/producer/`, hướng dẫn: `docs/producer.md`). Nó ghi vào `events.bronze.lastfm` theo schema `batch/producer/schema.py`.
+
+**Producer cũ của speed (ngừng dùng).** Nó vẫn còn trong repo, chạy được bằng `docker compose --profile legacy up scrobble-producer`, nhưng ghi vào `scrobble.raw` mà Spark không còn đọc. Không bật song song với producer batch: cả hai dùng chung API key Last.fm. Mô tả cũ: `stream/producer/produce_scrobbles.py` poll theo lịch từng user, chỉ lấy scrobble mới bằng tham số `from` (không lấy lại 50 bài gần nhất mỗi lần), gọi `user.getRecentTracks` với `extended=1` (để có `loved`). Lần chạy đầu chỉ lấy scrobble trong `--backfill-minutes` (mặc định 10) phút gần nhất, không đẩy ~25.000 event cũ. Nếu user có nhiều hơn `--max-pages` trang bài mới (ví dụ producer tắt lâu), producer lấy các trang **cũ nhất** trước và đọc tiếp ở lần poll sau, nên không bỏ sót bài nào. Checkpoint (event đã gửi và `last_uts`) nằm ở `dataset/state/<user>_seen.json`.
 
 ```bash
 python stream/producer/produce_scrobbles.py --once --statuses A --limit 50   # chạy thử trên máy
@@ -62,28 +69,30 @@ docker compose --profile replay run --rm -e REPLAY_RATE=200 replay
 docker compose --profile replay run --rm replay python stream/producer/replay_scrobbles.py   --bootstrap-servers kafka:9094 --file /app/dataset/sample/scrobbles.jsonl --rate 200 --shift-to-now
 ```
 
+- Replay ghi vào **`events.demo.lastfm`** (mặc định, không lấy `KAFKA_TOPIC` của `.env`). Spark đọc topic này, batch consumer thì không, nên dữ liệu giả không lẫn vào tầng Bronze.
 - Mặc định giữ nguyên thời điểm nghe và `ingested_at` trong file (độ trễ giả lập 30–400 giây), nên event không bị coi là đến muộn. `--shift-to-now` dời cả log (giữ độ trễ từng event) và tính lại `event_id`.
 - Replay đặt `source=replay`, và Spark chỉ gửi yêu cầu metadata cho event `source=lastfm` (`--metadata-sources`), nên dữ liệu giả **không tốn request Last.fm**. Phát lại log thật muốn có metadata thì thêm `--source lastfm`.
 - Trên Git Bash (Windows), thêm `MSYS_NO_PATHCONV=1` trước lệnh, nếu không đường dẫn `/app/...` sẽ bị đổi thành `C:/Program Files/Git/app/...`.
 
 ## Speed layer
 
-Spark **chỉ đọc Kafka** rồi gọi `stream/processing/pipeline.py::process_events` cho từng partition. Không có watermark hay cửa sổ stateful của Spark. Thay vào đó:
+Spark **chỉ đọc Kafka** (`events.bronze.lastfm`, `events.demo.lastfm`) rồi gọi `stream/processing/pipeline.py::process_events` cho từng partition. Message batch không có trường `user`, nên Spark lấy username từ `user_profile.name`. Không có watermark hay cửa sổ stateful của Spark. Thay vào đó:
 
-- **Khử trùng** `event_id` bằng Lua trên Redis (khóa có TTL `--dedupe-days`, mặc định 7 ngày); chạy lại micro-batch hay replay hai lần không đếm dôi.
+- **Metadata có sẵn:** với message batch (`schema_version` = `"1.0"`), thời lượng bài và tag lấy thẳng từ message (`track_metadata`, `artist_metadata`), không gửi `metadata.request`.
+- **Khử trùng** `event_id` (do producer tính) bằng Lua trên Redis (khóa có TTL `--dedupe-days`, mặc định 7 ngày); chạy lại micro-batch hay replay hai lần không đếm dôi.
 - **Mọi khóa Redis đều có TTL** (thống kê toàn thời gian của user: `--user-ttl-days` 90, gia hạn mỗi lần nghe) và Redis chạy `noeviction`: đầy bộ nhớ thì báo lỗi ghi chứ không lặng lẽ xóa khóa khử trùng.
 - Khóa user **không phân biệt hoa thường** (`Alice` = `alice`), khớp `fact_listen.user_id`.
 - Khi khởi động, Spark so checkpoint với offset Kafka; nếu checkpoint đi trước (topic bị tạo lại) thì dừng và báo lỗi, thay vì bỏ qua message mới.
 - **Thống kê theo user** (tổng, theo ngày, top bài/nghệ sĩ/album, 50 lượt gần nhất). Thành viên của top bài và album có dạng `nghệ sĩ - tên`, nên hai bài cùng tên của hai nghệ sĩ không bị gộp.
 - **Top-K toàn cục** theo cửa sổ 5 phút và 1 giờ, tính theo **thời gian nghe** (không phải thời gian xử lý).
 - **HBase** (tầng serving): `music_scrobble_events` (event thô), `fact_listen` (dòng phẳng khớp bảng trường nhóm đã chốt: `docs/fields.csv`), snapshot theo user/ngày (ghi một lần mỗi user mỗi partition, không ghi cho từng event) và các bảng metadata.
-- Event đến muộn (> `--late-after-seconds`, mặc định 1800) được ghi thêm vào `music_late_events`.
+- Event đến muộn (> `--late-after-seconds`, mặc định 1800) được ghi thêm vào `music_late_events`. Với message batch, độ trễ tính từ `trigger_time` (lúc cửa sổ producer đóng), vì producer lấy trọn giờ trước nên tính từ lúc nghe thì event nào cũng trễ tới 1 giờ.
 
-Khóa thực thể (`t:`, `a:`, `al:`) và `event_id` dùng **cùng công thức với bảng trường của nhóm** (`stream/common/ids.py`) và dựa trên tên chuẩn hóa, không dựa MBID, nên batch và stream ghép được theo cùng khóa.
+`event_id` lấy nguyên từ message của producer, không tính lại. Khóa thực thể (`t:`, `a:`, `al:`) tính bằng `stream/common/ids.py`, dựa trên tên chuẩn hóa chứ không dựa MBID, để batch và stream ghép được theo cùng khóa (`docs/architecture.md` mục 3.3).
 
 ## Metadata
 
-Mặc định artist, track, album là yêu cầu **dùng chung** (không truyền `username` cho Last.fm): cùng một bài do nhiều user nghe chỉ tốn một request. `userplaycount` theo từng user chỉ lấy khi chạy Spark với `--per-user-stats` (mỗi cặp user × mục một request, rất tốn). Lỗi tạm thời được thử lại có backoff, lỗi vĩnh viễn không thử lại, và lỗi 29 không bị đưa vào dead-letter. Yêu cầu vào dead-letter được ghi `failed` và **không bị gửi lại trong `--failure-backoff`** (mặc định 6 giờ) dù bài đó được nghe lại.
+Phần này chỉ áp dụng cho event định dạng cũ có `source=lastfm` (message batch đã kèm metadata). Mặc định artist, track, album là yêu cầu **dùng chung** (không truyền `username` cho Last.fm): cùng một bài do nhiều user nghe chỉ tốn một request. `userplaycount` theo từng user chỉ lấy khi chạy Spark với `--per-user-stats` (mỗi cặp user × mục một request, rất tốn). Lỗi tạm thời được thử lại có backoff, lỗi vĩnh viễn không thử lại, và lỗi 29 không bị đưa vào dead-letter. Yêu cầu vào dead-letter được ghi `failed` và **không bị gửi lại trong `--failure-backoff`** (mặc định 6 giờ) dù bài đó được nghe lại.
 
 ## API
 
@@ -113,21 +122,23 @@ Top album toàn cục cần chạy phiên bản API và Spark mới; dữ liệu
 ## Cấu trúc
 
 ```text
-stream/common/       ids, giới hạn tốc độ, client Last.fm, fact_listen, yêu cầu metadata, kafka_utils
-stream/producer/     poll thật (produce_scrobbles) và replay (replay_scrobbles)
+stream/common/       bronze_event (đọc message batch), ids, fact_listen, giới hạn tốc độ, client Last.fm, yêu cầu metadata
+stream/producer/     replay (replay_scrobbles); produce_scrobbles là producer cũ, ngừng dùng
 stream/processing/   pipeline (lõi), realtime_store (Redis), spark_speed_layer (đọc Kafka)
 stream/metadata/     worker (gọi getInfo) và sink (ghi HBase, Redis)
 stream/storage/      hbase_store, redis_reader, redis_utils
 stream/api/          API HTTP chỉ đọc
 stream/tools/        gen_sample_events, show_user_analytics
-docs/                stream-flow.md, CHANGES.md, fields.csv (bảng trường của nhóm)
-tests/               test_pipeline.py (bản gốc), test_fixes.py, test_review_fixes.py, test_integration_redis.py (Redis thật), fakes.py
+docs/                architecture.md (kiến trúc chung), stream-flow.md, CHANGES.md, fields.csv (bảng trường của nhóm)
+tests/               test_bronze_event.py (message batch), test_pipeline.py, test_fixes.py, test_review_fixes.py,
+                     test_integration_redis.py (Redis thật), fakes.py; test_producer.py, test_batch_consumer.py của batch
 ```
 
 ## Kiểm thử
 
 ```bash
-python -m unittest discover -s tests -t .                 # 79 test; không cần Docker
+pip install -r batch/requirements.txt                     # test của batch cần celery, jsonschema, minio, ...
+python -m unittest discover -s tests -t .                 # không cần Docker; test Spark tự bỏ qua nếu thiếu pyspark
 docker compose up -d redis
 python -m unittest tests.test_integration_redis -v        # chạy CHÍNH đoạn Lua trên Redis thật (db 15, bị xóa sạch)
 ```
@@ -139,13 +150,16 @@ Không có Redis thì `test_integration_redis` tự bỏ qua.
 - Tạo lại container Kafka và HBase: offset và dữ liệu còn nguyên; Spark và API tự nối lại.
 - Producer `--once` với 3 user thật: 9 scrobble, 28 yêu cầu metadata, đều `available`; duration được cộng vào `listening_ms`.
 
-**Chưa chạy:** producer poll đủ 406 user trong thời gian dài.
+**Chưa chạy:** toàn hệ thống trên Docker với producer batch thật; producer chạy đủ 406 user trong thời gian dài. Các kết quả ở trên là của producer cũ.
 
 ## Nâng cấp từ bản cũ
 
+- Checkpoint Spark mới là `spark-speed-layer-v5` (đổi topic sang `events.bronze.lastfm`, `events.demo.lastfm`). Checkpoint `v4` thuộc topic `scrobble.raw`, không dùng nữa.
+- Replay ghi vào `events.demo.lastfm` thay cho `scrobble.raw`.
+
 - Xóa khóa Redis cũ `analytics:user:*` (khóa mới có tiền tố `analytics:v2`, thành viên top đã đổi sang `nghệ sĩ - tên`).
 - Khóa `analytics:v2:user:*` tạo bởi bản trước đợt 2 **không có TTL** và có thể viết hoa (`RU-SHUTNICK`), trong khi bản mới dùng chữ thường. Chúng không được đọc nữa và không tự hết hạn; nếu không cần thì xóa tay.
-- Checkpoint Spark mới là `spark-speed-layer-v4`: Kafka bản trước ghi log vào `/tmp` trong container (mất khi tạo lại), nên checkpoint v3 không còn khớp. Nay Kafka ghi vào volume (`KAFKA_LOG_DIRS`).
+- (Bản trước) checkpoint `spark-speed-layer-v4`: Kafka bản trước nữa ghi log vào `/tmp` trong container (mất khi tạo lại), nên checkpoint v3 không còn khớp. Nay Kafka ghi vào volume (`KAFKA_LOG_DIRS`).
 - HBase dùng volume mới `hbase_data_v2` cùng volume ZooKeeper `hbase_zk`. Volume cũ `hbase_data` bị kẹt "Master is initializing" nên được giữ nguyên, không dùng nữa (bản sao lưu: `dataset/state/backup/`). Không cần thì xóa: `docker volume rm bigdata-music-analytics_hbase_data`.
 - Row key HBase theo user đổi sang chữ thường; id thực thể metadata đổi từ MBID sang tên chuẩn hóa, nên các dòng metadata cũ không còn được dùng.
 - Bảng HBase `fact_listen` được `stream-init` và Spark tự tạo.

@@ -1,6 +1,7 @@
 """Ánh xạ event của stream sang bảng fact_listen mà nhóm đã chốt (docs/fields.csv).
 
-Event của stream có dạng lồng (scrobble_event.*). Batch và serving làm việc với dòng phẳng
+Đầu vào là message của producer batch (stream/common/bronze_event.py) hoặc event cũ của speed,
+cả hai đều có dạng lồng (scrobble_event.*). Batch và serving làm việc với dòng phẳng
 fact_listen, nên speed layer cũng ghi một bản phẳng này vào HBase (bảng fact_listen) để hai
 layer dùng chung khóa và tên trường.
 
@@ -12,10 +13,16 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from stream.common.bronze_event import (
+    MAX_TAGS,
+    embedded_duration_ms,
+    embedded_tags,
+    event_username,
+    ingested_epoch,
+)
 from stream.common.ids import (
     make_album_id,
     make_artist_id,
-    make_event_id,
     make_track_id,
     normalize_mbid,
     normalize_text,
@@ -47,16 +54,24 @@ def to_fact_listen(
     duration_ms: Any = None,
     now: int | None = None,
 ) -> dict[str, Any]:
-    """Event lồng của stream -> một dòng fact_listen. Ném ValueError nếu thiếu dữ liệu bắt buộc."""
+    """Event lồng của stream -> một dòng fact_listen. Ném ValueError nếu thiếu dữ liệu bắt buộc.
+
+    `event_id` lấy nguyên từ message (producer tính, docs/architecture.md mục 3.3), không tính lại.
+    `tags`, `duration_ms` = None thì lấy metadata có sẵn trong message batch (mục 3.5).
+    `crawled_at` = `now` nếu truyền vào, không thì lấy `ingested_at` của message.
+    """
     scrobble = event.get("scrobble_event") or {}
     artist = scrobble.get("artist") or {}
     album = scrobble.get("album") or {}
-    username = str(event.get("user") or "").strip()
+    username = event_username(event)
+    event_id = str(event.get("event_id") or "").strip()
     track_name = str(scrobble.get("name") or "").strip()
     artist_name = str(artist.get("name") or "").strip()
     track_norm, artist_norm = normalize_text(track_name), normalize_text(artist_name)
     if not username or not track_norm or not artist_norm:
         raise ValueError("thiếu user, tên bài hoặc tên nghệ sĩ")
+    if not event_id:
+        raise ValueError("thiếu event_id")
     try:
         listened_at = int(str((scrobble.get("date") or {}).get("uts") or ""))
     except ValueError:
@@ -67,9 +82,15 @@ def to_fact_listen(
     track_id = make_track_id(artist_norm, track_norm)
     album_name = str(album.get("name") or "").strip()
     album_norm = normalize_text(album_name)
-    clean_tags = [str(tag) for tag in (tags or [])][:5]
+    if tags is None:
+        tags, tag_source = embedded_tags(event)
+    if duration_ms is None:
+        duration_ms = embedded_duration_ms(event)
+    if now is None:
+        now = ingested_epoch(event)
+    clean_tags = [str(tag) for tag in (tags or [])][:MAX_TAGS]
     return {
-        "event_id": make_event_id(user_id, listened_at, track_id),
+        "event_id": event_id,
         "user_id": user_id,
         "listened_at": listened_at,
         "listened_date": when.strftime("%Y-%m-%d"),

@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from stream.common.bronze_event import event_username
 from stream.common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen
 from stream.common.ids import user_key
 from stream.common.metadata_common import build_metadata_requests
@@ -52,7 +53,7 @@ def event_row_key(event: dict[str, Any]) -> str:
     date = (event.get("scrobble_event", {}) or {}).get("date", {}) or {}
     uts = int(str(date.get("uts", "0")) or "0")
     reverse_timestamp = 9_999_999_999_999 - (uts * 1000)
-    return f"{_user_prefix(str(event.get('user', '')))}{reverse_timestamp:013d}#{event['event_id']}"
+    return f"{_user_prefix(event_username(event))}{reverse_timestamp:013d}#{event['event_id']}"
 
 
 LONG_TEXT_COLUMNS = {"wiki:data", "bio:data", "tracks:data"}
@@ -124,7 +125,7 @@ class HBaseStore:
         date = scrobble.get("date", {}) or {}
         artist = scrobble.get("artist", {}) or {}
         album = scrobble.get("album", {}) or {}
-        username = str(event.get("user", ""))
+        username = event_username(event)
         refs = {request["entity_type"]: request["entity_id"] for request in build_metadata_requests(event)}
         row_key = event_row_key(event)
         self._put(
