@@ -1,8 +1,5 @@
-# Producer Last.fm: làm xong bản demo trong 60 phút
-
-Mục tiêu: một job lấy đủ các lượt nghe trong một giờ, ghép 5 nhóm dữ liệu của
-biên bản ngày 25/10/2026, gửi Kafka có xác nhận; Celery Beat chạy mỗi giờ.
-Mốc 60 phút dành cho bản demo với một user, khi Docker đã chạy và đã có API key.
+# Producer Last.fm
+Dành cho bản demo với một user, khi Docker đã chạy và đã có API key.
 Thời gian tải image, số lượt nghe và phản hồi Last.fm có thể làm thời gian dài hơn.
 
 ```text
