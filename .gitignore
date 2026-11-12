@@ -209,3 +209,10 @@ $RECYCLE.BIN/
 
 # Linux
 *~
+redis/redis.conf
+__pycache__/
+*.py[cod]
+dataset/raw/
+dataset/state/
+dataset/sample/
+.vscode/

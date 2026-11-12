@@ -1,14 +1,13 @@
-save 900 1    
-save 300 10      
-save 60 10000  
-
-dir /data
-
-protected-mode no
-bind 0.0.0.0
+# KHÔNG cần cho Docker Compose (mật khẩu lấy từ REDIS_PASSWORD trong .env).
+# Chỉ dùng nếu bạn chạy Redis ngoài Docker; chép thành redis/redis.conf (đã bị gitignore).
+bind 127.0.0.1
+protected-mode yes
 port 6379
 requirepass <your_super_secret_password>
 
+save 300 10
 appendonly no
 
+# Mọi khóa của speed layer đều có TTL. noeviction: đầy bộ nhớ thì báo lỗi ghi thay vì lặng lẽ xóa khóa khử trùng (sẽ đếm trùng).
+maxmemory 512mb
 maxmemory-policy noeviction
