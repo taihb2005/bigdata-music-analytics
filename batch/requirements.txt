@@ -15,3 +15,9 @@ jsonschema>=4.23.0,<5.0.0
 
 # Configuration Management
 python-dotenv>=1.0.0
+filelock>=3.13.0
+
+# Delta Lake & Columnar Processing (Silver & Quality Layer)
+deltalake>=0.18.0
+pyarrow>=16.0.0
+

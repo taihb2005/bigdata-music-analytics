@@ -47,31 +47,56 @@ class KafkaWriter:
         else:
             self.delivered += 1
 
-    def publish_file(self, topic, path):
-        with path.open(encoding="utf-8") as handle:
-            for line in handle:
-                value = json.loads(line)
-                key = value.get("user_profile", {}).get("name", value.get("username", "unknown"))
-                deadline = time.monotonic() + 35
-                while True:
-                    try:
-                        self.producer.produce(topic, key=key.encode(), value=line.rstrip("\n").encode(), callback=self.on_delivery)
-                        self.producer.poll(0)
-                        break
-                    except BufferError:
-                        if time.monotonic() >= deadline:
-                            raise KafkaDeliveryError("Kafka local buffer stayed full; replay the saved run") from None
-                        self.producer.poll(0.5)
-                    except KafkaException:
-                        raise KafkaDeliveryError("Kafka enqueue failed; replay the saved run") from None
-                if self.failed:
-                    raise KafkaDeliveryError("Kafka delivery failed; replay the saved run")
+    def publish_record(self, topic, value, raw_line=None):
+        """Đưa một bản ghi JSON vào Kafka buffer kèm key theo username."""
+        payload = json.dumps(value, ensure_ascii=False) if raw_line is None else raw_line.rstrip("\n")
+        key = value.get("user_profile", {}).get("name", value.get("username", "unknown"))
+        deadline = time.monotonic() + 35
+        while True:
+            try:
+                self.producer.produce(
+                    topic,
+                    key=key.encode(),
+                    value=payload.encode(),
+                    callback=self.on_delivery,
+                )
+                self.producer.poll(0)
+                break
+            except BufferError:
+                if time.monotonic() >= deadline:
+                    raise KafkaDeliveryError("Kafka local buffer stayed full; replay the saved run") from None
+                self.producer.poll(0.5)
+            except KafkaException:
+                raise KafkaDeliveryError("Kafka enqueue failed; replay the saved run") from None
+        if self.failed:
+            raise KafkaDeliveryError("Kafka delivery failed; replay the saved run")
 
-    def finish(self):
-        remaining = self.producer.flush(35)
+    def publish_records(self, topic, records, flush=False):
+        """Đẩy danh sách bản ghi vào Kafka, tùy chọn flush ngay sau khi enqueue."""
+        count = 0
+        for record in records:
+            self.publish_record(topic, record)
+            count += 1
+        if flush and count:
+            self.flush_pending()
+        return count
+
+    def flush_pending(self, timeout=35):
+        """Flush các message đang chờ trong buffer Kafka và xác nhận delivery."""
+        remaining = self.producer.flush(timeout)
         if remaining or self.failed:
             raise KafkaDeliveryError(f"Kafka delivery incomplete: pending={remaining}, failed={self.failed}")
         return self.delivered
+
+    def publish_file(self, topic, path):
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                self.publish_record(topic, json.loads(line), raw_line=line)
+
+    def finish(self):
+        return self.flush_pending(35)
 
 
 def inspect_events(settings, demo=False, count=2, timeout=20):

@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 
 # Thêm PROJECT_ROOT vào sys.path nếu cần
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from batch.bronze.consumer.kafka_consumer import BatchConsumer
 from batch.common.config import BatchConsumerConfig, load_env
-from batch.consumer.kafka_consumer import BatchConsumer
 from batch.datalake import MinioStorageClient
 
 
@@ -28,13 +28,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minio-endpoint", help="Địa chỉ MinIO / S3 endpoint (vd: localhost:9000)")
     parser.add_argument("--minio-access-key", help="MinIO Access Key / Root User")
     parser.add_argument("--minio-secret-key", help="MinIO Secret Key / Root Password")
-    parser.add_argument("--minio-secure", action="store_true", help="Bật HTTPS cho MinIO")
+    parser.add_argument("--minio-secure", action="store_true", default=None, help="Bật HTTPS cho MinIO")
     parser.add_argument("--bucket", help="Tên bucket trên Data Lake (mặc định: bronze)")
     parser.add_argument("--prefix", help="Tiền tố lưu trữ trong bucket (mặc định: events)")
     parser.add_argument("--max-buffer-size", help="Ngưỡng kích thước xả batch (vd: 128MB, 256MB)")
-    parser.add_argument("--flush-interval", type=float, help="Ngưỡng thời gian xả batch (giây, mặc định 1800s)")
+    parser.add_argument("--flush-interval", type=float, help="Ngưỡng thời gian xả batch (giây, mặc định 3600s = 1 giờ)")
     parser.add_argument("--gc-max-age", type=int, help="Ngưỡng tuổi tối đa của file .tmp để GC xóa (giây, mặc định 86400s)")
     parser.add_argument("--run-gc", action="store_true", help="Chỉ chạy Garbage Collector dọn file .tmp cũ rồi thoát")
+    parser.add_argument("--drain", action="store_true", help="Đọc hết bản ghi hiện có trên Kafka, xả toàn bộ buffer lên Bronze rồi thoát")
+    parser.add_argument("--max-empty-polls", type=int, default=3, help="Số lần poll rỗng liên tiếp để kết thúc chế độ --drain")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Mức log")
     return parser.parse_args()
 
@@ -65,7 +67,8 @@ def main() -> None:
         return
 
     consumer = BatchConsumer(config=config)
-    consumer.start()
+    consumer.start(drain=args.drain, max_empty_polls=args.max_empty_polls)
+
 
 
 if __name__ == "__main__":

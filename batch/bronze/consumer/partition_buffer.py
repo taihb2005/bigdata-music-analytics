@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger("batch.consumer.buffer")
+logger = logging.getLogger("batch.bronze.consumer.buffer")
 
 
 def generate_filename(

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     from kafka import KafkaProducer
     from batch.datalake import StorageClient
 
-logger = logging.getLogger("batch.consumer.dlq")
+logger = logging.getLogger("batch.bronze.consumer.dlq")
 
 
 class RecordValidationError(ValueError):

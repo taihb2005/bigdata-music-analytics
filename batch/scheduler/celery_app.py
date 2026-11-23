@@ -4,8 +4,10 @@ from celery import Celery
 from celery.beat import BeatLazyFunc
 from celery.schedules import crontab
 
-from .config import Settings
-from .window import current_hour
+from batch.bronze.producer.window import current_hour
+from batch.common.config import load_env
+
+load_env()
 
 
 def _build_redis_url(env_var: str, default_db: int) -> str:
@@ -25,11 +27,14 @@ def _build_redis_url(env_var: str, default_db: int) -> str:
     return raw_url
 
 
+INGESTION_QUEUE = "lastfm_ingestion"
+SILVER_QUEUE = "silver_cleaning"
+
 app = Celery(
-    "lastfm_producer",
+    "batch_scheduler",
     broker=_build_redis_url("CELERY_BROKER_URL", 0),
     backend=_build_redis_url("CELERY_RESULT_BACKEND", 1),
-    include=["batch.producer.tasks"],
+    include=["batch.scheduler.tasks"],
 )
 
 app.conf.update(
@@ -38,7 +43,11 @@ app.conf.update(
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],
-    task_default_queue="lastfm_ingestion",
+    task_default_queue=INGESTION_QUEUE,
+    task_routes={
+        "batch.bronze.producer.*": {"queue": INGESTION_QUEUE},
+        "batch.silver.run_hourly_cleaning": {"queue": SILVER_QUEUE},
+    },
     worker_prefetch_multiplier=1,
     broker_connection_retry_on_startup=True,
     broker_transport_options={"visibility_timeout": 21600},
@@ -46,12 +55,20 @@ app.conf.update(
     visibility_timeout=21600,
     result_expires=86400,
     beat_schedule={
-        f"hourly-{username}": {
-            "task": "batch.producer.ingest_user_window",
+        "hourly-ingest-all-users": {
+            "task": "batch.bronze.producer.enqueue_hourly_users",
             "schedule": crontab(minute=0),
             # Evaluated by Beat while publishing, then serialized as an ordinary integer.
-            "kwargs": {"username": username, "trigger_time": BeatLazyFunc(current_hour), "demo": False},
-        }
-        for username in Settings().users
+            "kwargs": {"trigger_time": BeatLazyFunc(current_hour), "demo": False},
+            "options": {"queue": INGESTION_QUEUE},
+        },
+        "hourly-bronze-to-silver": {
+            "task": "batch.silver.run_hourly_cleaning",
+            "schedule": crontab(minute=30),
+            # Evaluate the current UTC hour when Beat fires (:30 -> cleans previous hour Bronze data
+            # on dedicated SILVER_QUEUE in parallel with any ongoing crawl).
+            "kwargs": {"trigger_time": BeatLazyFunc(current_hour)},
+            "options": {"queue": SILVER_QUEUE},
+        },
     },
 )

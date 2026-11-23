@@ -16,6 +16,14 @@ class MetadataNotFound(PermanentAPIError):
     pass
 
 
+class PrivateProfileError(PermanentAPIError):
+    """User bật chế độ ẩn lịch sử nghe nhạc (Last.fm API error 17)."""
+
+
+class UserNotFoundError(PermanentAPIError):
+    """User không tồn tại trên Last.fm (Last.fm API error 6)."""
+
+
 def as_list(value):
     if value is None:
         return []
@@ -25,7 +33,7 @@ def as_list(value):
 
 
 class LastFMClient:
-    def __init__(self, api_key, interval=0.4, attempts=5, session=None):
+    def __init__(self, api_key, interval=0.4, attempts=5, session=None, persistent_cache=None, shared_metadata=False):
         if not api_key:
             raise PermanentAPIError("Set LASTFM_API_KEY in .env first")
         self.api_key = api_key
@@ -35,9 +43,16 @@ class LastFMClient:
         self.session.headers.update({"User-Agent": "bigdata-lastfm-producer/1.0"})
         self.last_call = 0.0
         self.cache = OrderedDict()
+        self.persistent_cache = persistent_cache
+        self.shared_metadata = shared_metadata
 
     def close(self):
         self.session.close()
+        if self.persistent_cache is not None:
+            try:
+                self.persistent_cache.close()
+            except Exception:
+                pass
 
     def get(self, method, **params):
         for attempt in range(self.attempts):
@@ -62,8 +77,16 @@ class LastFMClient:
                             return payload
                         if code in {"8", "11", "16", "29"}:
                             transient = True
+                        elif code == "17":
+                            target_user = params.get("user") or params.get("username") or "unknown"
+                            raise PrivateProfileError(
+                                f"{method}: user '{target_user}' has private recent tracks (API error 17)"
+                            )
                         elif code == "6" and method in {"track.getInfo", "artist.getInfo", "album.getInfo"}:
                             raise MetadataNotFound(f"{method}: metadata unavailable (code 6)")
+                        elif code == "6" and method.startswith("user."):
+                            target_user = params.get("user") or params.get("username") or "unknown"
+                            raise UserNotFoundError(f"{method}: user '{target_user}' not found (code 6)")
                         else:
                             raise PermanentAPIError(f"{method}: API error {code or response.status_code}")
             except (requests.RequestException, ValueError):
@@ -73,10 +96,33 @@ class LastFMClient:
                 time.sleep(min(2 ** attempt, 15))
         raise TemporaryAPIError(f"{method}: temporary failure after {self.attempts} attempts") from None
 
+    def user_profile(self, username):
+        if self.persistent_cache is not None:
+            cached = self.persistent_cache.get("user.getInfo", {"user": username}, allow_shared=True)
+            if cached is not None:
+                val, err = cached
+                if not err and isinstance(val, dict) and val:
+                    return val
+        payload = self.get("user.getInfo", user=username)
+        profile = payload.get("user")
+        if not isinstance(profile, dict):
+            raise TemporaryAPIError("user.getInfo: missing user object")
+        if self.persistent_cache is not None:
+            self.persistent_cache.put("user.getInfo", {"user": username}, profile, None)
+        return profile
+
     def metadata(self, method, root, **params):
         # Lifetime = one job; bounded cache key includes username for user-specific counts.
         key = (method, tuple(sorted(params.items())))
         if key not in self.cache:
+            if self.persistent_cache is not None:
+                cached = self.persistent_cache.get(method, params, allow_shared=self.shared_metadata)
+                if cached is not None:
+                    self.cache[key] = cached
+                    if len(self.cache) > 512:
+                        self.cache.popitem(last=False)
+                    self.cache.move_to_end(key)
+                    return self.cache[key]
             try:
                 payload = self.get(method, **params)
                 value = payload.get(root)
@@ -85,17 +131,79 @@ class LastFMClient:
                 result = (value, None)
             except MetadataNotFound:
                 result = ({}, f"{method}:not_found")
+            if self.persistent_cache is not None:
+                self.persistent_cache.put(method, params, result[0], result[1])
             self.cache[key] = result
             if len(self.cache) > 512:
                 self.cache.popitem(last=False)
         self.cache.move_to_end(key)
         return self.cache[key]
 
+    def recent_bulk(self, username, max_pages=3, limit=200, from_ts=None, to_ts=None, max_events=None):
+        """Lấy nhiều trang scrobble liên tiếp của một user trong các giờ đã hoàn tất (< to_ts)."""
+        page, total_pages = 1, max(1, int(max_pages))
+        per_page = max(1, min(200, int(limit)))
+        collected = 0
+        query_extra = {}
+        if from_ts is not None:
+            query_extra["from"] = max(0, int(from_ts))
+        if to_ts is not None:
+            query_extra["to"] = int(to_ts)
+
+        while page <= total_pages:
+            payload = self.get(
+                "user.getRecentTracks",
+                user=username,
+                limit=per_page,
+                page=page,
+                extended=1,
+                **query_extra,
+            )
+            block = payload.get("recenttracks")
+            if not isinstance(block, dict) or not isinstance(block.get("@attr"), dict):
+                raise TemporaryAPIError("user.getRecentTracks: missing pagination data")
+            try:
+                api_total_pages = int(block["@attr"].get("totalPages", 1) or 1)
+                total_pages = min(int(max_pages), max(1, api_total_pages))
+            except (TypeError, ValueError):
+                raise TemporaryAPIError("user.getRecentTracks: invalid totalPages") from None
+            if "track" not in block and str(block["@attr"].get("total")) != "0":
+                raise TemporaryAPIError("user.getRecentTracks: missing track data")
+
+            for record in as_list(block.get("track")):
+                if isinstance(record, dict):
+                    attrs = record.get("@attr", {})
+                    if isinstance(attrs, dict) and str(attrs.get("nowplaying", "")).lower() == "true":
+                        continue
+                    try:
+                        timestamp = int(record["date"]["uts"])
+                    except (KeyError, TypeError, ValueError):
+                        yield record
+                        collected += 1
+                        if max_events is not None and collected >= max_events:
+                            return
+                        continue
+                    if from_ts is not None and timestamp < int(from_ts):
+                        continue
+                    if to_ts is not None and timestamp >= int(to_ts):
+                        continue
+                yield record
+                collected += 1
+                if max_events is not None and collected >= max_events:
+                    return
+            page += 1
+
     def recent(self, username, start, end):
         page, total_pages = 1, 1
         while page <= total_pages:
-            payload = self.get("user.getRecentTracks", user=username, limit=200,
-                               page=page, extended=1, **{"from": max(0, start - 1), "to": end})
+            payload = self.get(
+                "user.getRecentTracks",
+                user=username,
+                limit=200,
+                page=page,
+                extended=1,
+                **{"from": max(0, start - 1), "to": end},
+            )
             block = payload.get("recenttracks")
             if not isinstance(block, dict) or not isinstance(block.get("@attr"), dict):
                 raise TemporaryAPIError("user.getRecentTracks: missing pagination data")
@@ -123,8 +231,13 @@ class LastFMClient:
     def latest_completed_trigger(self, username, current_trigger):
         # Select a completed hour containing real scrobbles for a meaningful smoke test.
         for page in range(1, 11):
-            payload = self.get("user.getRecentTracks", user=username, page=page, limit=200,
-                               **{"to": current_trigger})
+            payload = self.get(
+                "user.getRecentTracks",
+                user=username,
+                page=page,
+                limit=200,
+                **{"to": current_trigger},
+            )
             block = payload.get("recenttracks")
             if not isinstance(block, dict):
                 raise TemporaryAPIError("user.getRecentTracks: missing recenttracks")

@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING, Any
 
 from kafka import ConsumerRebalanceListener, KafkaConsumer, KafkaProducer, OffsetAndMetadata, TopicPartition
 
+from batch.bronze.consumer.dlq import DeadLetterQueueHandler, validate_event_schema
+from batch.bronze.consumer.partition_buffer import PartitionBuffer, build_object_key, generate_filename
 from batch.common.config import BatchConsumerConfig
-from batch.consumer.partition_buffer import PartitionBuffer, build_object_key, generate_filename
-from batch.consumer.dlq import DeadLetterQueueHandler, validate_event_schema
 from batch.datalake import MinioStorageClient, StorageClient
 
-logger = logging.getLogger("batch.consumer")
+logger = logging.getLogger("batch.bronze.consumer")
 
 
 def make_offset_and_metadata(offset: int, metadata: str = "") -> OffsetAndMetadata:
@@ -238,8 +238,8 @@ class BatchConsumer:
                 flushed_files.append(res)
         return flushed_files
 
-    def start(self) -> None:
-        """Vòng lặp tiêu thụ và xử lý tin nhắn liên tục."""
+    def start(self, drain: bool = False, max_empty_polls: int = 3) -> None:
+        """Vòng lặp tiêu thụ và xử lý tin nhắn liên tục (hoặc chạy tới khi hết message nếu drain=True)."""
         # Đảm bảo bucket Data Lake sẵn sàng
         try:
             self.storage.ensure_bucket(self.config.s3_bucket)
@@ -250,6 +250,7 @@ class BatchConsumer:
             self.consumer = self._init_consumer()
 
         self.running = True
+        empty_polls = 0
 
         # Đăng ký signal handler để dừng an toàn
         def _handle_signal(signum, frame):
@@ -281,12 +282,22 @@ class BatchConsumer:
 
                 total_polled = sum(len(recs) for recs in records_by_partition.values())
                 if total_polled > 0:
+                    empty_polls = 0
                     summary = ", ".join(
                         f"p{tp.partition}: {len(recs)} bản ghi" for tp, recs in records_by_partition.items()
                     )
                     logger.info(
                         f">>> Đã nhận {total_polled} bản ghi mới từ topic '{self.config.topic}' ({summary})"
                     )
+                else:
+                    empty_polls += 1
+                    if drain and empty_polls >= max(1, max_empty_polls):
+                        logger.info(
+                            f"Chế độ --drain: Đã hết bản ghi mới sau {empty_polls} lần poll rỗng. "
+                            "Tiến hành xả toàn bộ buffer lên Bronze và kết thúc..."
+                        )
+                        break
+
 
                 # Xử lý bản ghi theo từng partition
                 for tp, records in records_by_partition.items():
