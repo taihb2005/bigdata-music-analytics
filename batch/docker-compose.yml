@@ -27,7 +27,9 @@ services:
     container_name: redis
     restart: always
     ports:
-      - "6379:6379"
+      # Trùng khai báo với redis ở docker-compose.yml gốc: phải GIỐNG HỆT (127.0.0.1) để compose gộp làm một;
+      # khác nhau thì Docker bind cổng 6379 hai lần và Redis không khởi động được ("address already in use").
+      - "127.0.0.1:6379:6379"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
     command:

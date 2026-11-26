@@ -106,17 +106,6 @@ python stream/tools/show_user_analytics.py <username>        # bản dòng lện
 
 Không truyền `end`, "bây giờ" là bucket mới nhất có dữ liệu (đúng khi replay dữ liệu cũ).
 
-## Giao diện Streamlit tạm thời
-
-Khởi động API bằng Docker Compose, sau đó mở PowerShell tại thư mục dự án:
-
-```powershell
-python -m pip install -r requirements-ui.txt
-python -m streamlit run streamlit_app.py
-```
-
-Mở địa chỉ Streamlit in ra trong terminal (thường là `http://localhost:8501`), nhập username và bấm **Tải / làm mới dữ liệu**. Mặc định giao diện gọi API ở `http://localhost:8001`; có thể sửa địa chỉ này ở thanh bên. Giao diện hiển thị thống kê, xu hướng, lượt nghe từ HBase và top bài hát/nghệ sĩ/album toàn hệ thống. Top từng loại có cửa sổ thời gian riêng.
-
 Top album toàn cục cần chạy phiên bản API và Spark mới; dữ liệu album được tích lũy từ lúc phiên bản này chạy, không hồi tố các event cũ.
 
 ## Cấu trúc
