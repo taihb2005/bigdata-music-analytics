@@ -50,7 +50,7 @@ Kafka, HBase Thrift và API không có xác thực. Kafka, MinIO và Redis đang
 
 ## Producer
 
-Producer chính là **producer batch** (`batch/producer/`, hướng dẫn: `docs/producer.md`). Nó ghi vào `events.bronze.lastfm` theo schema `batch/producer/schema.py`.
+Producer chính là **producer batch** (`batch/bronze/producer/`, hướng dẫn: `docs/producer.md`). Nó ghi vào `events.bronze.lastfm` theo schema `batch/bronze/producer/schema.py`.
 
 **Producer cũ của speed (ngừng dùng).** Nó vẫn còn trong repo, chạy được bằng `docker compose --profile legacy up scrobble-producer`, nhưng ghi vào `scrobble.raw` mà Spark không còn đọc. Không bật song song với producer batch: cả hai dùng chung API key Last.fm. Mô tả cũ: `stream/producer/produce_scrobbles.py` poll theo lịch từng user, chỉ lấy scrobble mới bằng tham số `from` (không lấy lại 50 bài gần nhất mỗi lần), gọi `user.getRecentTracks` với `extended=1` (để có `loved`). Lần chạy đầu chỉ lấy scrobble trong `--backfill-minutes` (mặc định 10) phút gần nhất, không đẩy ~25.000 event cũ. Nếu user có nhiều hơn `--max-pages` trang bài mới (ví dụ producer tắt lâu), producer lấy các trang **cũ nhất** trước và đọc tiếp ở lần poll sau, nên không bỏ sót bài nào. Checkpoint (event đã gửi và `last_uts`) nằm ở `dataset/state/<user>_seen.json`.
 

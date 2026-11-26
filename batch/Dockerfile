@@ -20,12 +20,13 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
     && apt-get purge -y --auto-remove gcc libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy mã nguồn module batch và tests
+# Copy mã nguồn module batch, danh sách users và tests
 COPY batch /app/batch
+COPY dataset/users /app/dataset/users
 COPY tests /app/tests
 
 # Khởi tạo thư mục output cho producer
 RUN mkdir -p /app/output
 
 # Mặc định hiển thị trợ giúp khi container chạy trực tiếp
-CMD ["python", "-m", "batch.producer", "--help"]
+CMD ["python", "-m", "batch.bronze.producer", "--help"]

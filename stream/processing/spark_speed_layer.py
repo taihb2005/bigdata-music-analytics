@@ -1,6 +1,6 @@
 """Speed layer: Kafka (events.bronze.lastfm) -> Spark Structured Streaming -> HBase (serving) + Redis (trạng thái nóng).
 
-Đọc message của producer batch (schema: batch/producer/schema.py, hợp đồng: docs/architecture.md mục 3).
+Đọc message của producer batch (schema: batch/bronze/producer/schema.py, hợp đồng: docs/architecture.md mục 3).
 Message batch không có `user`/`event_type`: Spark lấy `user` từ `user_profile.name` và mặc định
 `event_type = "scrobble"`, nên phần xử lý phía sau dùng chung được cho cả event định dạng cũ.
 
@@ -140,7 +140,7 @@ def guard_checkpoint(args) -> None:
 
 
 def bronze_event_schema():
-    """Schema Spark cho message batch (batch/producer/schema.py), chỉ gồm các trường speed dùng.
+    """Schema Spark cho message batch (batch/bronze/producer/schema.py), chỉ gồm các trường speed dùng.
 
     Kiểu phải khớp JSON thật, vì from_json gặp trường sai kiểu thì trả null (có thể cho cả dòng):
     schema_version là chuỗi "1.0"; image là mảng object; số liệu metadata là chuỗi.

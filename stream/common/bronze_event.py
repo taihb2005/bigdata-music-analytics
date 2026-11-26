@@ -1,6 +1,6 @@
 """Đọc message của producer batch (topic events.bronze.lastfm, schema_version "1.0").
 
-Schema gốc: batch/producer/schema.py; hợp đồng giữa hai nhóm: docs/architecture.md (mục 3).
+Schema gốc: batch/bronze/producer/schema.py; hợp đồng giữa hai nhóm: docs/architecture.md (mục 3).
 
 Message batch khác event cũ của speed ở hai chỗ:
   - không có trường `user` và `event_type`; username nằm ở `user_profile.name`,

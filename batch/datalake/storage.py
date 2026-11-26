@@ -1,13 +1,46 @@
 """Giao tiếp lưu trữ Data Lake (MinIO / AWS S3) và Giao thức Ghi nguyên tử (Atomic Write)."""
 from __future__ import annotations
 
+import hashlib
 import logging
+import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 logger = logging.getLogger("batch.datalake.storage")
+
+
+@dataclass(frozen=True)
+class ObjectInfo:
+    """Thông tin định danh và phiên bản của một object trên Data Lake."""
+
+    object_name: str
+    size: int
+    etag: str
+    version_id: str | None = None
+    last_modified: float = 0.0
+
+    @property
+    def object_version(self) -> str:
+        """Nhận diện phiên bản object: ưu tiên version_id, nếu không có dùng ETag và kích thước."""
+        if self.version_id:
+            return str(self.version_id)
+        clean_etag = (self.etag or "").strip('"')
+        return f"{clean_etag}:{self.size}"
+
+
+def _is_completed_event_object(object_name: str) -> bool:
+    """Chỉ chọn file .jsonl.gz đã hoàn tất; bỏ qua .tmp và thư mục dead_letter."""
+    norm = object_name.strip("/")
+    if not norm or norm.endswith(".tmp"):
+        return False
+    parts = norm.split("/")
+    if "dead_letter" in parts:
+        return False
+    return norm.endswith(".jsonl.gz")
 
 
 @runtime_checkable
@@ -50,6 +83,19 @@ class StorageClient(Protocol):
     ) -> list[str]:
         """Dọn dẹp các file .tmp tồn đọng quá max_age_seconds (mặc định 24h) theo NFR-FT-02."""
         ...
+
+    def list_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        """Liệt kê toàn bộ object trong bucket/prefix (không lọc đuôi file)."""
+        ...
+
+    def list_completed_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        """Liệt kê các file .jsonl.gz đã hoàn tất trong bucket/prefix (bỏ qua .tmp và dead_letter)."""
+        ...
+
+    def get_object_bytes(self, bucket: str, object_name: str) -> bytes:
+        """Đọc toàn bộ nội dung bytes của một object từ bucket."""
+        ...
+
 
 
 class MinioStorageClient:
@@ -164,6 +210,160 @@ class MinioStorageClient:
             logger.error(f"Lỗi khi dọn dẹp file .tmp trên bucket {bucket}: {exc}")
         return deleted
 
+    def _list_bucket_objects(self, bucket: str, prefix: str = "", *, completed_only: bool = False) -> list[ObjectInfo]:
+        results: list[ObjectInfo] = []
+        if not self.client.bucket_exists(bucket):
+            return results
+        objects = self.client.list_objects(bucket, prefix=prefix, recursive=True)
+        for obj in objects:
+            name = obj.object_name or ""
+            if not name or name.endswith("/"):
+                continue
+            if completed_only and not _is_completed_event_object(name):
+                continue
+            last_mod = obj.last_modified
+            if isinstance(last_mod, datetime):
+                ts = last_mod.timestamp()
+            elif last_mod is not None:
+                ts = float(last_mod)
+            else:
+                ts = 0.0
+            results.append(
+                ObjectInfo(
+                    object_name=name,
+                    size=int(obj.size or 0),
+                    etag=str(obj.etag or "").strip('"'),
+                    version_id=getattr(obj, "version_id", None),
+                    last_modified=ts,
+                )
+            )
+        results.sort(key=lambda item: (item.last_modified, item.object_name))
+        return results
+
+    def list_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        """Liệt kê toàn bộ object trong bucket/prefix trên MinIO."""
+        return self._list_bucket_objects(bucket, prefix=prefix, completed_only=False)
+
+    def list_completed_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        """Liệt kê các file .jsonl.gz đã hoàn tất trên MinIO (bỏ qua .tmp và dead_letter)."""
+        return self._list_bucket_objects(bucket, prefix=prefix, completed_only=True)
+
+    def get_object_bytes(self, bucket: str, object_name: str) -> bytes:
+        response = self.client.get_object(bucket, object_name)
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
+
+class LocalDiskStorageClient:
+    """Hiện thực StorageClient trên ổ đĩa cục bộ (mô phỏng cấu trúc bucket/prefix của S3/MinIO)."""
+
+    def __init__(self, root_dir: str | Path) -> None:
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def _object_path(self, bucket: str, object_name: str) -> Path:
+        clean_key = object_name.strip("/").replace("\\", "/")
+        return self.root_dir / bucket / clean_key
+
+    def ensure_bucket(self, bucket: str) -> None:
+        (self.root_dir / bucket).mkdir(parents=True, exist_ok=True)
+
+    def upload_file(
+        self,
+        bucket: str,
+        object_name: str,
+        file_path: str | Path,
+        content_type: str = "application/gzip",
+    ) -> None:
+        dest = self._object_path(bucket, object_name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, dest)
+
+    def upload_bytes(
+        self,
+        bucket: str,
+        object_name: str,
+        data: bytes,
+        content_type: str = "application/json",
+    ) -> None:
+        dest = self._object_path(bucket, object_name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+
+    def atomic_rename(self, bucket: str, tmp_key: str, final_key: str) -> None:
+        src = self._object_path(bucket, tmp_key)
+        dst = self._object_path(bucket, final_key)
+        if not src.exists():
+            raise FileNotFoundError(f"Không tìm thấy file nguồn {tmp_key}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.replace(dst)
+
+    def cleanup_stale_tmp(
+        self,
+        bucket: str,
+        prefix: str = "",
+        max_age_seconds: int = 86400,
+    ) -> list[str]:
+        bucket_dir = self.root_dir / bucket
+        if not bucket_dir.exists():
+            return []
+        now_ts = time.time()
+        deleted: list[str] = []
+        clean_prefix = prefix.strip("/")
+        for path in bucket_dir.rglob("*.tmp"):
+            rel = path.relative_to(bucket_dir).as_posix()
+            if clean_prefix and not rel.startswith(clean_prefix):
+                continue
+            age = now_ts - path.stat().st_mtime
+            if age >= max_age_seconds:
+                path.unlink(missing_ok=True)
+                deleted.append(rel)
+        return deleted
+
+    def _list_local_objects(self, bucket: str, prefix: str = "", *, completed_only: bool = False) -> list[ObjectInfo]:
+        bucket_dir = self.root_dir / bucket
+        if not bucket_dir.exists():
+            return []
+        clean_prefix = prefix.strip("/")
+        pattern = "*.jsonl.gz" if completed_only else "*"
+        results: list[ObjectInfo] = []
+        for path in bucket_dir.rglob(pattern):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(bucket_dir).as_posix()
+            if clean_prefix and not rel.startswith(clean_prefix):
+                continue
+            if completed_only and not _is_completed_event_object(rel):
+                continue
+            stat = path.stat()
+            etag = hashlib.sha256(path.read_bytes()).hexdigest()[:32]
+            results.append(
+                ObjectInfo(
+                    object_name=rel,
+                    size=int(stat.st_size),
+                    etag=etag,
+                    version_id=None,
+                    last_modified=float(stat.st_mtime),
+                )
+            )
+        results.sort(key=lambda item: (item.last_modified, item.object_name))
+        return results
+
+    def list_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        return self._list_local_objects(bucket, prefix=prefix, completed_only=False)
+
+    def list_completed_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        return self._list_local_objects(bucket, prefix=prefix, completed_only=True)
+
+    def get_object_bytes(self, bucket: str, object_name: str) -> bytes:
+        path = self._object_path(bucket, object_name)
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy object {bucket}/{object_name}")
+        return path.read_bytes()
+
 
 class MockStorageClient:
     """Mock storage phục vụ unit test và mô phỏng offline không cần kết nối mạng."""
@@ -228,3 +428,39 @@ class MockStorageClient:
                     del self.objects[bucket][key]
                     deleted.append(key)
         return deleted
+
+    def _list_mock_objects(self, bucket: str, prefix: str = "", *, completed_only: bool = False) -> list[ObjectInfo]:
+        self.ensure_bucket(bucket)
+        clean_prefix = prefix.strip("/")
+        results: list[ObjectInfo] = []
+        for key, (data, dt) in self.objects[bucket].items():
+            if clean_prefix and not key.startswith(clean_prefix):
+                continue
+            if completed_only and not _is_completed_event_object(key):
+                continue
+            etag = hashlib.sha256(data).hexdigest()[:32]
+            ts = dt.timestamp() if hasattr(dt, "timestamp") else 0.0
+            results.append(
+                ObjectInfo(
+                    object_name=key,
+                    size=len(data),
+                    etag=etag,
+                    version_id=None,
+                    last_modified=float(ts),
+                )
+            )
+        results.sort(key=lambda item: (item.last_modified, item.object_name))
+        return results
+
+    def list_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        return self._list_mock_objects(bucket, prefix=prefix, completed_only=False)
+
+    def list_completed_objects(self, bucket: str, prefix: str = "") -> list[ObjectInfo]:
+        return self._list_mock_objects(bucket, prefix=prefix, completed_only=True)
+
+    def get_object_bytes(self, bucket: str, object_name: str) -> bytes:
+        self.ensure_bucket(bucket)
+        if object_name not in self.objects[bucket]:
+            raise FileNotFoundError(f"Không tìm thấy object {bucket}/{object_name}")
+        return self.objects[bucket][object_name][0]
+

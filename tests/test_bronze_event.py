@@ -1,6 +1,6 @@
 """Speed layer đọc message của producer batch (events.bronze.lastfm, schema_version "1.0").
 
-Message mẫu dựng đúng theo batch/producer/schema.py. Nếu môi trường có jsonschema/requests (cài
+Message mẫu dựng đúng theo batch/bronze/producer/schema.py. Nếu môi trường có jsonschema/requests (cài
 batch/requirements.txt) thì test còn kiểm tra message mẫu bằng chính JSON Schema của batch.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ TRIGGER = 1_800_000_000  # 2027-01-15 08:00:00 UTC (Thứ sáu); cửa sổ prod
 
 
 def batch_event_id(username: str, uts: int, artist: str, track: str, album: str | None) -> str:
-    """Bản sao công thức event_identity của batch/producer/schema.py."""
+    """Bản sao công thức event_identity của batch/bronze/producer/schema.py."""
     parts = [username.casefold(), uts, artist, track, album]
     digest = hashlib.sha256(json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
     return "lastfm:" + digest
@@ -77,7 +77,7 @@ def bronze_event(user="Alice", track="Song", artist="Artist", album="Album", uts
 def _batch_schema_module():
     if not (importlib.util.find_spec("jsonschema") and importlib.util.find_spec("requests")):
         return None
-    from batch.producer import schema
+    from batch.bronze.producer import schema
 
     return schema
 

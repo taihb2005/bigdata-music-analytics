@@ -539,7 +539,7 @@ class ApiTests(unittest.TestCase):
             ("/users/alice/analytics", {"top": ["abc"]}, 400),
             ("/users/alice/analytics", {"top": ["0"]}, 400),
             ("/global/top", {"window": ["3d"]}, 400),
-            ("/global/top", {"kind": ["albums"]}, 400),
+            ("/global/top", {"kind": ["genres"]}, 400),
             ("/nope", {}, 404),
         ]:
             with self.assertRaises(ApiError) as ctx:

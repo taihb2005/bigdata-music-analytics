@@ -17,9 +17,9 @@ from batch.common.config import (
     parse_size_bytes,
     sanitize_minio_endpoint,
 )
-from batch.consumer.dlq import DeadLetterQueueHandler, validate_event_schema
-from batch.consumer.kafka_consumer import BatchConsumer, BatchRebalanceListener
-from batch.consumer.partition_buffer import PartitionBuffer, build_object_key, generate_filename
+from batch.bronze.consumer.dlq import DeadLetterQueueHandler, validate_event_schema
+from batch.bronze.consumer.kafka_consumer import BatchConsumer, BatchRebalanceListener
+from batch.bronze.consumer.partition_buffer import PartitionBuffer, build_object_key, generate_filename
 from batch.datalake import MockStorageClient
 
 
@@ -97,6 +97,15 @@ class TestBatchConsumerConfig(unittest.TestCase):
         finally:
             if os.path.exists(temp_env_path):
                 os.remove(temp_env_path)
+
+    def test_default_flush_interval_is_one_window_hour(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        self.assertEqual(BatchConsumerConfig().flush_interval_seconds, 3600.0)
+        cleaned_env = {k: v for k, v in os.environ.items() if k != "BATCH_FLUSH_INTERVAL_SECONDS"}
+        with patch("batch.common.config.load_env"), patch.dict(os.environ, cleaned_env, clear=True):
+            self.assertEqual(BatchConsumerConfig.from_env_and_args().flush_interval_seconds, 3600.0)
 
 
 class TestPartitionBuffer(unittest.TestCase):
