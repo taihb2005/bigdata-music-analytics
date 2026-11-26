@@ -290,9 +290,9 @@ def validate_raw_line(
     if crawled_at is None or ingested_float is None:
         add_error("INVALID_INGESTED_AT", f"ingested_at không đọc được hoặc thiếu múi giờ: {data.get('ingested_at')!r}")
 
-    # Sinh silver_event_id nếu đủ khóa cơ bản
-    silver_event_id: str | None = None
-    if uid and artist_norm and track_norm and listened_at is not None:
+    # event_id của Silver = event_id producer gắn sẵn (giống speed); thiếu thì tự tính nếu đủ khóa
+    silver_event_id: str | None = source_event_id.strip() if source_event_id and source_event_id.strip() else None
+    if silver_event_id is None and uid and artist_norm and track_norm and listened_at is not None:
         tid = make_track_id(artist_norm, track_norm)
         silver_event_id = make_event_id(uid, listened_at, tid)
 

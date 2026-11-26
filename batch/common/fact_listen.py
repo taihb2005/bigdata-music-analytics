@@ -28,6 +28,19 @@ FACT_LISTEN_FIELDS = [
 ]
 
 
+def silver_event_id(event: dict[str, Any], user_id: str, listened_at: int, track_id: str) -> str:
+    """event_id dùng chung với speed: lấy nguyên `event_id` producer đã gắn vào message.
+
+    Speed (stream/common/fact_listen.py) cũng giữ nguyên id này, nên cùng một lượt nghe có
+    cùng event_id ở cả batch view và realtime view. Chỉ khi message không có id (định dạng cũ)
+    mới tự tính bằng make_event_id.
+    """
+    raw = event.get("event_id")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return make_event_id(user_id, listened_at, track_id)
+
+
 def _positive_int(value: Any) -> int | None:
     try:
         number = int(value)
@@ -66,7 +79,7 @@ def to_fact_listen(
     album_norm = normalize_text(album_name)
     clean_tags = [str(tag) for tag in (tags or [])][:5]
     return {
-        "event_id": make_event_id(user_id, listened_at, track_id),
+        "event_id": silver_event_id(event, user_id, listened_at, track_id),
         "user_id": user_id,
         "listened_at": listened_at,
         "listened_date": when.strftime("%Y-%m-%d"),

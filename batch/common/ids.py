@@ -4,7 +4,9 @@ Công thức khớp bảng trường nhóm đã chốt (docs/fields.csv):
   track_id  = "t:"  + sha1(artist_norm, track_norm)[:16]
   artist_id = "a:"  + sha1(artist_norm)[:16]
   album_id  = "al:" + sha1(artist_norm, album_norm)[:16]
-  event_id  = sha1(user_id, listened_at, track_id)[:32]
+
+event_id lấy nguyên từ message producer (batch/common/fact_listen.py: silver_event_id), dùng chung
+với speed. make_event_id = sha1(user_id, listened_at, track_id)[:32] chỉ dùng khi message không có id.
 """
 from __future__ import annotations
 
