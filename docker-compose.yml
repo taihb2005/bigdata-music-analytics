@@ -1,5 +1,278 @@
-name: bigdata-music-analytics
+# ==============================================================================
+# Docker Compose Root - Quản lý toàn bộ hệ sinh thái Big Data Music Analytics
+# Sử dụng tính năng `include` để module hóa: Kafka (docker/) và Batch (batch/)
+# ==============================================================================
 
 include:
-  - docker/docker-compose.network.yml
-  - docker/batch-service.yml
+  - path: docker/docker-compose.network.yml
+  - path: docker/kafka.yml
+  - path: batch/docker-compose.yml
+
+# ==============================================================================
+services:
+  redis:
+    image: redis:8.2-alpine
+    container_name: redis
+    restart: always
+    mem_limit: 700m
+    ports:
+      - "127.0.0.1:6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Đặt REDIS_PASSWORD trong file .env}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "300 10"
+      - --dir
+      - /data
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - data-net
+      - inter-net
+
+  hbase:
+    image: harisekhon/hbase:2.1
+    container_name: hbase
+    hostname: hbase
+    restart: unless-stopped
+    mem_limit: 2g
+    ports:
+      - "127.0.0.1:16010:16010"
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - hbase_data_v2:/hbase-data
+      - hbase_zk:/tmp/hbase-root
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/9090' && echo list | hbase shell -n 2>&1 | grep -q 'row(s)'"]
+      interval: 20s
+      timeout: 60s
+      retries: 15
+      start_period: 60s
+    networks:
+      - data-net
+
+  stream-init:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: stream_init
+    command:
+      - python
+      - stream/bootstrap/init_stream_resources.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hbase:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - data-net
+
+  scrobble-producer:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: scrobble_producer
+    command:
+      - python
+      - stream/producer/produce_scrobbles.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --redis-url
+      - redis://redis:6379/0
+      - --statuses
+      - A
+      - --min-interval
+      - "60"
+      - --max-interval
+      - "900"
+      - --limit
+      - "50"
+    volumes:
+      - ./dataset/state:/app/dataset/state
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - data-net
+
+  spark-speed-layer:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+    container_name: spark_speed_layer
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.executorEnv.PYTHONPATH=/opt/app
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0
+      - /opt/app/stream/processing/spark_speed_layer.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --starting-offsets
+      - earliest
+      - --max-offsets-per-trigger
+      - "2000"
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/0
+      - --checkpoint
+      - /opt/app/dataset/state/spark-speed-layer-v4
+    volumes:
+      - .:/opt/app
+    environment:
+      PYTHONPATH: /opt/app
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 3g
+    networks:
+      - data-net
+
+  metadata-worker:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: metadata_worker
+    command:
+      - python
+      - stream/metadata/metadata_worker.py
+      - --redis-url
+      - redis://redis:6379/0
+      - --kafka-bootstrap
+      - kafka:9094
+      - --api-key
+      - ${LASTFM_API_KEY}
+      - --max-rps
+      - ${LASTFM_MAX_RPS:-1.0}
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - data-net
+
+  metadata-sink:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: metadata_sink
+    command:
+      - python
+      - stream/metadata/metadata_sink.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - data-net
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: stream_api
+    command:
+      - python
+      - stream/api/server.py
+      - --redis-url
+      - redis://redis:6379/0
+      - --hbase-host
+      - hbase
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - data-net
+
+  replay:
+    build:
+      context: .
+      dockerfile: docker/python-stream/Dockerfile
+    container_name: scrobble_replay
+    profiles: ["tools"]
+    command:
+      - python
+      - stream/producer/produce_scrobbles.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --redis-url
+      - redis://redis:6379/0
+      - --statuses
+      - A
+      - --replay-from-beginning
+      - --min-interval
+      - "0.1"
+      - --max-interval
+      - "0.5"
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: "no"
+    networks:
+      - data-net
+
+volumes:
+  hbase_data_v2:
+  hbase_zk:
+  redis_data:
+
+networks:
+  data-net:
+    name: data-net
+    driver: bridge
+  inter-net:
+    name: inter-net
+    driver: bridge
+    internal: true

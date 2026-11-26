@@ -1,0 +1,296 @@
+include:
+  - ../docker/kafka.yml
+
+services:
+  # ============================================================================
+  # 1. Hạ tầng lưu trữ & Hàng đợi của Batch (MinIO & Redis)
+  # ============================================================================
+  minio:
+    image: taihb2005/minio:1.0.0
+    container_name: datalake
+    hostname: minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ${MINIO_HOST_VOLUME:-minio_data}:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - bigdata-common-net
+
+  redis:
+    image: redis:8.2-alpine
+    container_name: redis
+    restart: always
+    ports:
+      - "6379:6379"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD}
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - "300 10"
+      - --dir
+      - /data
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - batch-net
+
+  # ============================================================================
+  # 2. Batch Consumer Service (Ingest Kafka -> MinIO Bronze Data Lake)
+  # ============================================================================
+  batch-consumer:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_consumer
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - batch.bronze.consumer
+      - --bootstrap-servers
+      - kafka:9094
+      - --topic
+      - ${KAFKA_TOPIC}
+      - --dlq-topic
+      - ${KAFKA_DLQ_TOPIC}
+      - --group-id
+      - ${KAFKA_GROUP_ID}
+      - --minio-endpoint
+      - minio:9000
+      - --bucket
+      - ${MINIO_BUCKET}
+      - --prefix
+      - ${MINIO_PREFIX}
+      - --flush-interval
+      - ${BATCH_FLUSH_INTERVAL_SECONDS}
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_PREFIX: ${MINIO_PREFIX}
+      MINIO_SECURE: ${MINIO_SECURE}
+      BATCH_FLUSH_INTERVAL_SECONDS: ${BATCH_FLUSH_INTERVAL_SECONDS}
+      BATCH_BUFFER_SIZE_BYTES: ${BATCH_BUFFER_SIZE_BYTES}
+      GC_MAX_AGE_SECONDS: ${GC_MAX_AGE_SECONDS}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  # ============================================================================
+  # 3. Batch Producer & Silver Services (Topic Init, Celery Workers, Beat)
+  # ============================================================================
+  kafka-init:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_kafka_init
+    command: ["python", "-m", "batch.bronze.producer", "init-topics"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  celery-worker:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_celery_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "batch.scheduler.celery_app:app", "worker", "-Q", "lastfm_ingestion", "--loglevel=INFO", "--concurrency=${CELERY_WORKER_CONCURRENCY}", "-n", "ingestion@%h"]
+    environment:
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY}
+      BATCH_PRODUCER_WORKERS: ${BATCH_PRODUCER_WORKERS}
+      LASTFM_API_KEY: ${LASTFM_API_KEY}
+      LASTFM_USERS: ${LASTFM_USERS:-}
+      LASTFM_USERS_FILE: ${LASTFM_USERS_FILE}
+      LASTFM_USER_STATUSES: ${LASTFM_USER_STATUSES}
+      LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_PREFIX: ${MINIO_PREFIX}
+      MINIO_SECURE: ${MINIO_SECURE}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+      - ../dataset/users:/app/dataset/users:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  celery-silver-worker:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_celery_silver_worker
+    restart: unless-stopped
+    command: ["celery", "-A", "batch.scheduler.celery_app:app", "worker", "-Q", "silver_cleaning", "--loglevel=INFO", "--concurrency=${CELERY_SILVER_CONCURRENCY}", "-n", "silver@%h"]
+    environment:
+      CELERY_SILVER_CONCURRENCY: ${CELERY_SILVER_CONCURRENCY}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_PREFIX: ${MINIO_PREFIX}
+      MINIO_SECURE: ${MINIO_SECURE}
+      SILVER_PIPELINE_VERSION: ${SILVER_PIPELINE_VERSION}
+      SILVER_BASE_PATH: ${SILVER_BASE_PATH}
+      QUALITY_BASE_PATH: ${QUALITY_BASE_PATH}
+      DEMO_SILVER_BASE_PATH: ${DEMO_SILVER_BASE_PATH}
+      SILVER_FUTURE_THRESHOLD_SECONDS: ${SILVER_FUTURE_THRESHOLD_SECONDS}
+      SILVER_PARTITION_BY_DATE: ${SILVER_PARTITION_BY_DATE}
+      SILVER_LOCK_FILE: ${SILVER_LOCK_FILE}
+      SILVER_PUSH_MINIO: ${SILVER_PUSH_MINIO:-false}
+      MINIO_SILVER_BUCKET: ${MINIO_SILVER_BUCKET:-silver}
+      MINIO_QUALITY_BUCKET: ${MINIO_QUALITY_BUCKET:-quality}
+      MINIO_DEMO_SILVER_BUCKET: ${MINIO_DEMO_SILVER_BUCKET:-silver-demo}
+      MINIO_SILVER_PREFIX: ${MINIO_SILVER_PREFIX:-}
+      SILVER_PUSH_INCLUDE_QUALITY: ${SILVER_PUSH_INCLUDE_QUALITY:-true}
+      SILVER_PUSH_FORCE: ${SILVER_PUSH_FORCE:-false}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+      - ../data/delta:/app/data/delta
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+  celery-beat:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    container_name: batch_celery_beat
+    restart: unless-stopped
+    command: ["celery", "-A", "batch.scheduler.celery_app:app", "beat", "--loglevel=INFO", "--schedule=/app/output/celerybeat-schedule"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - batch-net
+
+  app:
+    image: bigdata-batch:local
+    build:
+      context: ..
+      dockerfile: batch/Dockerfile
+    profiles: ["tools"]
+    environment:
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY}
+      CELERY_SILVER_CONCURRENCY: ${CELERY_SILVER_CONCURRENCY}
+      BATCH_PRODUCER_WORKERS: ${BATCH_PRODUCER_WORKERS}
+      LASTFM_API_KEY: ${LASTFM_API_KEY}
+      LASTFM_USERS: ${LASTFM_USERS:-}
+      LASTFM_USERS_FILE: ${LASTFM_USERS_FILE}
+      LASTFM_USER_STATUSES: ${LASTFM_USER_STATUSES}
+      LASTFM_MIN_INTERVAL: ${LASTFM_MIN_INTERVAL}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_PREFIX: ${MINIO_PREFIX}
+      MINIO_SECURE: ${MINIO_SECURE}
+      SILVER_PIPELINE_VERSION: ${SILVER_PIPELINE_VERSION}
+      SILVER_BASE_PATH: ${SILVER_BASE_PATH}
+      QUALITY_BASE_PATH: ${QUALITY_BASE_PATH}
+      DEMO_SILVER_BASE_PATH: ${DEMO_SILVER_BASE_PATH}
+      SILVER_FUTURE_THRESHOLD_SECONDS: ${SILVER_FUTURE_THRESHOLD_SECONDS}
+      SILVER_PARTITION_BY_DATE: ${SILVER_PARTITION_BY_DATE}
+      SILVER_LOCK_FILE: ${SILVER_LOCK_FILE}
+      SILVER_PUSH_MINIO: ${SILVER_PUSH_MINIO:-false}
+      MINIO_SILVER_BUCKET: ${MINIO_SILVER_BUCKET:-silver}
+      MINIO_QUALITY_BUCKET: ${MINIO_QUALITY_BUCKET:-quality}
+      MINIO_DEMO_SILVER_BUCKET: ${MINIO_DEMO_SILVER_BUCKET:-silver-demo}
+      MINIO_SILVER_PREFIX: ${MINIO_SILVER_PREFIX:-}
+      SILVER_PUSH_INCLUDE_QUALITY: ${SILVER_PUSH_INCLUDE_QUALITY:-true}
+      SILVER_PUSH_FORCE: ${SILVER_PUSH_FORCE:-false}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ../data/producer:/app/output
+      - ../data/delta:/app/data/delta
+      - ../dataset/users:/app/dataset/users:ro
+    networks:
+      - bigdata-common-net
+      - batch-net
+
+networks:
+  bigdata-common-net:
+    name: bigdata-common-net
+    driver: bridge
+  batch-net:
+    name: batch-net
+    driver: bridge
+
+volumes:
+  redis_data:
+  minio_data:
