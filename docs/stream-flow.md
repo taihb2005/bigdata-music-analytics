@@ -32,6 +32,8 @@ flowchart TD
     API --> H
 ```
 
+Bản ảnh của sơ đồ (cho slide hoặc nơi không hiển thị Mermaid): [`docs/img/stream-flow.png`](img/stream-flow.png). Sửa sơ đồ thì xuất lại ảnh.
+
 Batch consumer chỉ đọc `events.bronze.lastfm`, nên dữ liệu giả ở `events.demo.lastfm` không lẫn vào tầng Bronze của batch.
 
 ## Thành phần

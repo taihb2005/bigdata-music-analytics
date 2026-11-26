@@ -38,7 +38,7 @@ flowchart LR
 
     subgraph SPEED[Speed layer - nhóm speed]
         SS[Spark Structured Streaming<br/>micro-batch 10s] --> RV[(Redis<br/>realtime view)]
-        SS --> HB[(HBase<br/>fact_listen gần đây)]
+        SS --> HB[(HBase<br/>fact_listen)]
     end
 
     DEMO[(Kafka<br/>events.demo.lastfm<br/>replay, dữ liệu giả)]
@@ -68,7 +68,7 @@ Nét đứt là phần chưa làm hoặc phải sửa.
 | Spark speed layer, Redis, HBase | speed | `stream/processing/`, `stream/storage/`, `stream/common/bronze_event.py` | **Có.** Đọc `events.bronze.lastfm` và `events.demo.lastfm`. |
 | Metadata worker/sink của speed | speed | `stream/metadata/` | Có, nhưng message batch đã kèm metadata nên chỉ còn phục vụ event định dạng cũ. Có thể tắt. |
 | API serving | speed (tạm) | `stream/api/server.py` | Có. Mới đọc dữ liệu của speed. |
-| Hạ tầng | chung | `docker-compose.yml` (gốc) gọi `docker/docker-compose.network.yml`, `docker/kafka.yml`, `batch/docker-compose.yml` | `docker compose config` chạy được, gồm 14 service. |
+| Hạ tầng | chung | `docker-compose.yml` (gốc) gọi `docker/docker-compose.network.yml`, `docker/kafka.yml`, `batch/docker-compose.yml` | `docker compose config` chạy được. Mặc định 14 service; thêm `replay` (profile `replay`) và `scrobble-producer` (profile `legacy`) khi cần. |
 
 ---
 
@@ -90,7 +90,7 @@ Nét đứt là phần chưa làm hoặc phải sửa.
 6. **Speed** (`stream/`):
    - Spark Structured Streaming đọc **cùng topic** với nhóm batch, cộng thêm `events.demo.lastfm`. Offset do checkpoint riêng quản lý (`spark-speed-layer-v5`), cứ 10 giây một micro-batch.
    - Username lấy từ `user_profile.name`. Thời lượng bài và tag lấy thẳng từ message, không gọi Last.fm.
-   - Khử trùng theo `event_id` bằng Redis, cập nhật realtime view trên Redis, và ghi `fact_listen` gần đây vào HBase.
+   - Khử trùng theo `event_id` bằng Redis, cập nhật realtime view trên Redis, và ghi `fact_listen` vào HBase.
    - Dữ liệu giả (replay) ghi vào `events.demo.lastfm`. Batch consumer không đọc topic này, nên dữ liệu giả không lẫn vào Bronze.
 7. **Serving.** API đọc batch view cho phần dữ liệu trước mốc T, cộng realtime view cho phần từ T trở đi (mục 5).
 
@@ -206,7 +206,7 @@ Tầng Silver đã có code ở `batch/silver/` (ghi Delta Lake), nhưng mục n
 | Thống kê toàn thời gian của user | Redis | 90 ngày từ lần nghe cuối. **Không đem cộng với batch** (mục 5). |
 | Danh sách lượt nghe gần nhất | Redis | giới hạn theo số lượng |
 | Top-K toàn cục 5 phút → 24 giờ | Redis | theo cửa sổ |
-| `fact_listen` gần đây | HBase `fact_listen` | dùng cho tra cứu event |
+| `fact_listen` và event thô | HBase `fact_listen`, `music_scrobble_events` | **Không có TTL**: giữ mọi event speed từng nhận. Cần chốt: đặt TTL cho hai bảng này (ví dụ 30 ngày, bằng thời gian giữ khóa theo ngày), hay để chúng phình theo thời gian. Lưu ý giới hạn lưu trữ 100 MB của Last.fm (`README.md`). |
 
 ---
 

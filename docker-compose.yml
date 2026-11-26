@@ -181,13 +181,13 @@ services:
       - redis://redis:6379/0
       - --max-poll-interval-ms
       - "1200000"
-      - --kafka-bootstrap
+      - --bootstrap-servers
       - kafka:9094
-      - --api-key
-      - ${LASTFM_API_KEY}
       - --max-rps
       - ${LASTFM_MAX_RPS:-1.0}
-    # REDIS_PASSWORD lấy từ .env (Redis bật requirepass); thiếu dòng này worker không kết nối được Redis.
+    # LASTFM_API_KEY và REDIS_PASSWORD lấy từ .env. KHÔNG truyền API key qua command: argparse in nguyên
+    # dòng lệnh ra log khi gặp lỗi, làm lộ key (bản trước dùng --api-key/--kafka-bootstrap, worker không có
+    # hai tham số này nên chết ngay và in key ra log).
     env_file:
       - .env
     depends_on:
