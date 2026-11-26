@@ -369,7 +369,14 @@ class TestPhase2BronzeToSilverAcceptance(unittest.TestCase):
             expected_tid = make_track_id(expected_anorm, expected_tnorm)
             expected_aid = make_artist_id(expected_anorm)
             expected_alid = make_album_id(expected_anorm, expected_alnorm)
-            expected_eid = make_event_id(expected_uid, 1700000100, expected_tid)
+            # event_id lấy nguyên từ message producer, giống speed (stream/common/fact_listen.py)
+            expected_eid = ev["event_id"]
+            self.assertTrue(expected_eid.startswith("lastfm:"))
+            from stream.common.fact_listen import to_fact_listen as stream_to_fact_listen
+
+            stream_fact = stream_to_fact_listen(ev)
+            for key in ("event_id", "user_id", "track_id", "artist_id", "album_id"):
+                self.assertEqual(fact[key], stream_fact[key], key)
 
             self.assertEqual(fact["user_id"], expected_uid)
             self.assertEqual(fact["artist_norm"], expected_anorm)
@@ -388,6 +395,11 @@ class TestPhase2BronzeToSilverAcceptance(unittest.TestCase):
             self.assertEqual(direct_fact["duration_ms"], 180000)
             self.assertEqual(direct_fact["tags"], ["pop"])
             self.assertEqual(direct_fact["tag_source"], "track")
+
+            # Message định dạng cũ không có event_id -> Silver tự tính như trước
+            legacy = {key: value for key, value in ev.items() if key != "event_id"}
+            legacy_fact = to_fact_listen(legacy, now=1700001000)
+            self.assertEqual(legacy_fact["event_id"], make_event_id(expected_uid, 1700000100, expected_tid))
 
     def test_05_06_07_13_missing_album_mbid_duration_loved_and_artist_counts(self) -> None:
         """Tình huống 5, 6, 7, 13: Thiếu album/MBID, duration=0, loved=null, artist thiếu bộ đếm tổng."""
