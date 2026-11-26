@@ -138,6 +138,40 @@ class DeltaLakeManager:
         for tname in QUALITY_TABLE_SPECS:
             self._open_or_create(tname, is_demo=False)
 
+    def _overwrite_empty(
+        self,
+        table_name: str,
+        is_demo: bool = False,
+        partition_by: list[str] | None = None,
+    ) -> None:
+        uri = self.table_uri(table_name, is_demo=is_demo)
+        self._ensure_s3_bucket(uri)
+        opts = _build_storage_options(self.config, uri)
+        empty_pa = rows_to_pyarrow_table(table_name, [])
+        write_deltalake(
+            uri,
+            empty_pa,
+            mode="overwrite",
+            partition_by=partition_by,
+            storage_options=opts,
+        )
+
+    def reset_tables_for_reprocess(self) -> None:
+        """Đặt lại toàn bộ bảng Silver và bảng Quality (trừ pipeline_runs) để chạy làm sạch lại từ đầu."""
+        for tname in SILVER_TABLE_SPECS:
+            part = ["listened_date"] if (tname == "fact_listen" and self.config.partition_fact_by_date) else None
+            self._overwrite_empty(tname, is_demo=False, partition_by=part)
+
+            demo_uri = self.table_uri(tname, is_demo=True)
+            demo_opts = _build_storage_options(self.config, demo_uri)
+            if DeltaTable.is_deltatable(demo_uri, storage_options=demo_opts):
+                self._overwrite_empty(tname, is_demo=True, partition_by=part)
+
+        for tname in QUALITY_TABLE_SPECS:
+            if tname == "pipeline_runs":
+                continue
+            self._overwrite_empty(tname, is_demo=False)
+
     def read_rows(self, table_name: str, is_demo: bool = False) -> list[dict[str, Any]]:
         """Đọc toàn bộ các dòng hiện có của một bảng Delta thành danh sách dict."""
         uri = self.table_uri(table_name, is_demo=is_demo)

@@ -140,6 +140,7 @@ class BronzeToSilverJob:
         self,
         custom_specs: list[InputFileSpec] | None = None,
         fail_after_fact_merge: bool = False,
+        reprocess_all: bool | None = None,
     ) -> PipelineRunReport:
         """Thực thi quy trình 6 bước chuẩn cho một lượt chạy job."""
         self.config.lock_file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,11 +150,16 @@ class BronzeToSilverJob:
             # Đảm bảo toàn bộ bảng Delta đã được khởi tạo
             self.delta.ensure_all_tables()
 
+            do_reprocess = self.config.reprocess_all if reprocess_all is None else bool(reprocess_all)
+            if do_reprocess:
+                logger.info("Chế độ --reprocess-all: đặt lại bảng Silver/Quality (giữ pipeline_runs) và chạy lại toàn bộ luồng làm sạch")
+                self.delta.reset_tables_for_reprocess()
+
             started_at = int(time.time())
             run_id = f"silver_{started_at}_{uuid.uuid4().hex[:10]}"
 
             # Bước 1 & 2: Chọn tập file data theo quy chuẩn thiết kế và ghi trạng thái running
-            succeeded_keys = self.delta.load_succeeded_file_keys(self.config.pipeline_version)
+            succeeded_keys = set() if do_reprocess else self.delta.load_succeeded_file_keys(self.config.pipeline_version)
             input_specs = self._discover_input_files(succeeded_keys, custom_specs=custom_specs)
 
             report = PipelineRunReport(

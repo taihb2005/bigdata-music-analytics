@@ -492,6 +492,7 @@ class BatchSilverConfig:
     minio_silver_prefix: str = ""
     push_include_quality: bool = True
     push_force: bool = False
+    reprocess_all: bool = False
 
     def __init__(
         self,
@@ -510,6 +511,7 @@ class BatchSilverConfig:
         minio_silver_prefix: str = "",
         push_include_quality: bool = True,
         push_force: bool = False,
+        reprocess_all: bool = False,
         *,
         minio_endpoint: str | None = None,
         minio_access_key: str | None = None,
@@ -533,6 +535,7 @@ class BatchSilverConfig:
         self.minio_silver_prefix = str(minio_silver_prefix).strip("/")
         self.push_include_quality = push_include_quality
         self.push_force = push_force
+        self.reprocess_all = reprocess_all
 
         if minio_endpoint is not None:
             ep, sec = sanitize_minio_endpoint(minio_endpoint, minio_secure)
@@ -617,6 +620,7 @@ class BatchSilverConfig:
             minio_silver_prefix=os.getenv("MINIO_SILVER_PREFIX", "").strip("/"),
             push_include_quality=_env_bool("SILVER_PUSH_INCLUDE_QUALITY", True),
             push_force=_env_bool("SILVER_PUSH_FORCE", False),
+            reprocess_all=_env_bool("SILVER_REPROCESS_ALL", False),
         )
         cfg.storage.apply_args(args, bucket_arg="bronze_bucket", prefix_arg="bronze_prefix")
         _apply_cli_overrides(
@@ -641,4 +645,6 @@ class BatchSilverConfig:
                 cfg.push_include_quality = False
             if getattr(args, "force", None) is True:
                 cfg.push_force = True
+            if getattr(args, "reprocess_all", None) is True:
+                cfg.reprocess_all = True
         return cfg

@@ -81,6 +81,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Upload đè lại toàn bộ file local lên MinIO kể cả file đã tồn tại cùng kích thước",
     )
+    parser.add_argument(
+        "--reprocess-all",
+        action="store_true",
+        default=None,
+        help="Đặt lại các bảng Silver & Quality (giữ nguyên Bronze và lịch sử pipeline_runs) rồi làm sạch lại toàn bộ dữ liệu từ Bronze",
+    )
     parser.add_argument("--sample", type=int, default=2, help="Số dòng mẫu hiển thị khi chạy inspect")
     return parser
 
