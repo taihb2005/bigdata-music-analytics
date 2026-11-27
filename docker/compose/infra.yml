@@ -9,7 +9,7 @@ services:
     hostname: kafka
     restart: unless-stopped
     ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:${KAFKA_EXTERNAL_PORT:-9092}:9092"
+      - "9002:9092"
     expose:
       - "9094"
     environment:
@@ -48,13 +48,13 @@ services:
     hostname: minio
     restart: unless-stopped
     ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
-      - "${HOST_BIND_IP:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "19000:9000"
+      - "19001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     volumes:
-      - ${MINIO_HOST_VOLUME:-minio_data}:/data
+      - minio_data:/data
     command: server /data --console-address ":9001"
     networks:
       - music-net
@@ -66,7 +66,7 @@ services:
     restart: always
     mem_limit: 700m
     ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
+      - "6379:6379"
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?Đặt REDIS_PASSWORD trong file .env}
     command:
@@ -99,9 +99,9 @@ services:
     restart: unless-stopped
     mem_limit: 2g
     ports:
-      - "${HOST_BIND_IP:-127.0.0.1}:16010:16010"
-      - "${HOST_BIND_IP:-127.0.0.1}:9090:9090"
-      - "${HOST_BIND_IP:-127.0.0.1}:8080:8080"
+      - "16010:16010"
+      - "9090:9090"
+      - "8080:8080"
     volumes:
       - hbase_data_v2:/hbase-data
       - hbase_zk:/tmp/hbase-root

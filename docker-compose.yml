@@ -27,7 +27,11 @@ networks:
 
 volumes:
   kafka_data:
+    external: true
+    name: batch_kafka_data
   minio_data:
+    external: true
+    name: batch_minio_data
   redis_data:
   hbase_data_v2:
   hbase_zk:
