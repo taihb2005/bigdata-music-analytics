@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from batch.common.ids import (
+from common.ids import (
     make_event_id,
     make_track_id,
     normalize_text,

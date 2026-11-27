@@ -11,8 +11,8 @@ from batch.silver.validator import (
     parse_int64_non_negative,
     parse_int64_positive,
 )
-from batch.common.fact_listen import to_fact_listen
-from batch.common.ids import (
+from common.fact_listen import to_fact_listen_batch as to_fact_listen
+from common.ids import (
     make_artist_id,
     normalize_mbid,
     normalize_text,

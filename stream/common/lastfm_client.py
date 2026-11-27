@@ -11,7 +11,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from stream.common.ids import (
+from common.env import load_env as load_dotenv
+from common.ids import (
     make_event_id,
     make_track_id,
     normalize_text,
@@ -19,19 +20,6 @@ from stream.common.ids import (
 
 
 API_URL = "https://ws.audioscrobbler.com/2.0/"
-
-
-def load_dotenv(path: Path | None = None) -> None:
-    """Nạp các biến chưa tồn tại từ file .env của dự án."""
-    env_path = path or Path(__file__).resolve().parents[2] / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 class LastFmError(RuntimeError):

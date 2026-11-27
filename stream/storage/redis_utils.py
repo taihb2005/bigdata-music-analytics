@@ -3,10 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from stream.common.lastfm_client import load_dotenv
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from common.env import PROJECT_ROOT, load_env as load_dotenv
 
 
 def redis_password() -> str | None:

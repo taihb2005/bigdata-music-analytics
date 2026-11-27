@@ -1,0 +1,5 @@
+-r batch.txt
+-r gold.txt
+-r stream.txt
+-r api.txt
+-r ui.txt

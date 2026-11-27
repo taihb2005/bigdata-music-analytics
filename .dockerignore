@@ -5,6 +5,8 @@ tmp
 reports
 notebooks
 .env
+batch/.env
+docker/.env
 **/__pycache__
 *.pyc
 dataset/LastFM User Charts.xlsx
@@ -12,17 +14,24 @@ dataset/raw
 dataset/state
 redis/redis.conf
 
-# Các thư mục và file được nạp vào Docker context
+# Các thư mục và file được nạp vào Docker build context tại thư mục gốc
+!common/
+!common/**
 !batch/
 !batch/**
 !stream/
 !stream/**
+!api/
+!api/**
+!ui/
+!ui/**
 !scripts/
 !scripts/**
 !docker/
 !docker/**
+!requirements/
+!requirements/**
 !tests/
 !tests/**
 !dataset/users/
 !dataset/users/**
-!requirements.txt

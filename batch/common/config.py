@@ -8,30 +8,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from dotenv import load_dotenv
+from common.env import PROJECT_ROOT, load_env
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_USERS_FILE = PROJECT_ROOT / "dataset" / "users" / "showoffs_all_users.json"
 
 
 # ==============================================================================
 # 0. Tiện ích nạp môi trường & chuyển đổi kiểu dữ liệu
 # ==============================================================================
-def load_env(path: Path | None = None) -> None:
-    """Nạp các biến môi trường từ file .env theo thứ tự ưu tiên: root -> batch -> docker."""
-    if path is not None and path.exists():
-        load_dotenv(dotenv_path=path)
-        return
-
-    for env_path in (
-        PROJECT_ROOT / ".env",
-        PROJECT_ROOT / "batch" / ".env",
-        PROJECT_ROOT / "docker" / ".env",
-    ):
-        if env_path.exists():
-            load_dotenv(dotenv_path=env_path)
-
-
 load_env()
 
 

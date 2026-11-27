@@ -6,9 +6,9 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from stream.common.bronze_event import event_username
-from stream.common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen
-from stream.common.ids import user_key
+from common.bronze_event import event_username
+from common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen_stream as to_fact_listen
+from common.ids import user_key
 from stream.common.metadata_common import build_metadata_requests
 
 

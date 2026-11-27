@@ -5,7 +5,7 @@ import os
 import signal
 from threading import Event
 
-from dotenv import load_dotenv
+from common.env import load_env as load_dotenv
 
 from .catalog import Settings
 from .job import refresh

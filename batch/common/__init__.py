@@ -15,8 +15,8 @@ from batch.common.config import (
     parse_size_bytes,
     sanitize_minio_endpoint,
 )
-from batch.common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen
-from batch.common.ids import (
+from common.fact_listen import FACT_LISTEN_FIELDS, to_fact_listen_batch as to_fact_listen
+from common.ids import (
     make_album_id,
     make_artist_id,
     make_event_id,

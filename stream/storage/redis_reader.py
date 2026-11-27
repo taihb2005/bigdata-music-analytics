@@ -5,7 +5,7 @@ import json
 import time
 from typing import Any
 
-from stream.common.ids import user_key
+from common.ids import user_key
 from stream.processing.realtime_store import (
     BUCKET_SECONDS,
     latest_bucket_start,

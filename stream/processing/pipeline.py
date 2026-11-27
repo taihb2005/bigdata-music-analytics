@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from stream.common.bronze_event import adapt_event, embedded_duration_ms, is_bronze_event
+from common.bronze_event import adapt_event, embedded_duration_ms, is_bronze_event
 from stream.common.metadata_common import build_metadata_requests, metadata_cache_key
 from stream.processing.realtime_store import (
     analytics_values,

@@ -1,0 +1,5 @@
+-r common.txt
+deltalake>=1.2.0,<2.0.0
+duckdb>=1.4.0,<2.0.0
+pyarrow>=21.0.0,<25.0.0
+minio>=7.2.0,<8.0.0

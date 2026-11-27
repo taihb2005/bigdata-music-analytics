@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from stream.common.ids import (
+from common.ids import (
     make_album_id,
     make_artist_id,
     make_track_id,

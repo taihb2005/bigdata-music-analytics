@@ -1,4 +1,4 @@
-"""Temporary Streamlit dashboard for the music analytics HTTP API."""
+"""Streamlit dashboard for the music analytics HTTP API (Realtime Stream & Batch Gold)."""
 from __future__ import annotations
 
 import json

@@ -6,8 +6,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from stream.common.bronze_event import event_username
-from stream.common.ids import user_key
+from common.bronze_event import event_username
+from common.ids import user_key
 
 # Tiền tố v2: thành viên của các ZSET đã đổi từ "tên bài" sang "nghệ sĩ - bài" nên không trộn
 # với dữ liệu cũ. Xóa khoá analytics:user:* của bản cũ nếu còn.

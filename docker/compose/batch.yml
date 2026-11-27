@@ -1,0 +1,218 @@
+# ==============================================================================
+# Pipeline Batch: Producer (Celery) -> Bronze (MinIO) -> Silver (Delta) -> Gold
+# ==============================================================================
+services:
+  kafka-init:
+    profiles: ["batch", "stream", "all"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    container_name: batch_kafka_init
+    command: ["python", "-m", "batch.bronze.producer", "init-topics"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-events.bronze.lastfm}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-events.bronze.dead-letter}
+      KAFKA_DEMO_TOPIC: ${KAFKA_DEMO_TOPIC:-events.demo.lastfm}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - music-net
+
+  batch-consumer:
+    profiles: ["batch", "all"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    container_name: batch_consumer
+    restart: unless-stopped
+    command:
+      - python
+      - -m
+      - batch.bronze.consumer
+      - --bootstrap-servers
+      - kafka:9094
+      - --topic
+      - ${KAFKA_TOPIC:-events.bronze.lastfm}
+      - --dlq-topic
+      - ${KAFKA_DLQ_TOPIC:-events.bronze.dead-letter}
+      - --group-id
+      - ${KAFKA_GROUP_ID:-batch-bronze-consumer}
+      - --minio-endpoint
+      - minio:9000
+      - --bucket
+      - ${MINIO_BUCKET:-bronze}
+      - --prefix
+      - ${MINIO_PREFIX:-events}
+      - --flush-interval
+      - ${BATCH_FLUSH_INTERVAL_SECONDS:-3600}
+    env_file:
+      - .env
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+    networks:
+      - music-net
+
+  celery-worker:
+    profiles: ["batch", "all"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    container_name: batch_celery_worker
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "batch.scheduler.celery_app:app",
+        "worker",
+        "-Q",
+        "lastfm_ingestion",
+        "--loglevel=INFO",
+        "--concurrency=${CELERY_WORKER_CONCURRENCY:-4}",
+        "-n",
+        "ingestion@%h",
+      ]
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ./data/producer:/app/output
+      - ./dataset/users:/app/dataset/users:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - music-net
+
+  celery-silver-worker:
+    profiles: ["batch", "all"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    container_name: batch_celery_silver_worker
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "batch.scheduler.celery_app:app",
+        "worker",
+        "-Q",
+        "silver_cleaning",
+        "--loglevel=INFO",
+        "--concurrency=${CELERY_SILVER_CONCURRENCY:-1}",
+        "-n",
+        "silver@%h",
+      ]
+    env_file:
+      - .env
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ./data/producer:/app/output
+      - ./data/delta:/app/data/delta
+    depends_on:
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - music-net
+
+  celery-beat:
+    profiles: ["batch", "all"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    container_name: batch_celery_beat
+    restart: unless-stopped
+    command:
+      [
+        "celery",
+        "-A",
+        "batch.scheduler.celery_app:app",
+        "beat",
+        "--loglevel=INFO",
+        "--schedule=/app/output/celerybeat-schedule",
+      ]
+    env_file:
+      - .env
+    environment:
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ./data/producer:/app/output
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - music-net
+
+  gold-worker:
+    profiles: ["batch", "gold", "all"]
+    image: music-gold:local
+    build:
+      context: .
+      dockerfile: docker/gold.Dockerfile
+    container_name: batch_gold_worker
+    env_file:
+      - .env
+    environment:
+      GOLD_SILVER_PATH: ${GOLD_SILVER_PATH:-${SILVER_BASE_PATH:-data/delta/silver}/fact_listen}
+      GOLD_MINIO_ENDPOINT: ${GOLD_MINIO_ENDPOINT:-minio:9000}
+    volumes:
+      - ./data/delta:/app/data/delta:ro
+    depends_on:
+      minio:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - music-net
+
+  app:
+    profiles: ["tools"]
+    image: music-batch:local
+    build:
+      context: .
+      dockerfile: docker/batch.Dockerfile
+    env_file:
+      - .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9094
+      MINIO_ENDPOINT: minio:9000
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+      PRODUCER_OUTPUT_DIR: /app/output
+    volumes:
+      - ./data/producer:/app/output
+      - ./data/delta:/app/data/delta
+      - ./dataset/users:/app/dataset/users:ro
+    networks:
+      - music-net

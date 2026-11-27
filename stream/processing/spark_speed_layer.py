@@ -20,8 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from stream.common.bronze_event import BRONZE_TOPIC, DEMO_TOPIC
-from stream.common.lastfm_client import load_dotenv
+from common.bronze_event import BRONZE_TOPIC, DEMO_TOPIC
+from common.env import load_env as load_dotenv
 from stream.common.metadata_common import encode_message
 from stream.processing.pipeline import (  # noqa: F401  (re-export cho test và công cụ khác)
     PipelineConfig,

@@ -33,8 +33,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-from stream.common.bronze_event import DEMO_TOPIC  # noqa: E402
-from stream.common.ids import make_event_id, make_track_id, normalize_text  # noqa: E402
+from common.bronze_event import DEMO_TOPIC  # noqa: E402
+from common.ids import make_event_id, make_track_id, normalize_text  # noqa: E402
 
 
 def _parse_time(value: str) -> datetime:

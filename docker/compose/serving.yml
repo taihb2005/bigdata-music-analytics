@@ -1,0 +1,60 @@
+# ==============================================================================
+# Tầng Serving dùng chung: HTTP API & Streamlit Dashboard
+# Chạy độc lập mượt mà với mọi profile (gold, batch, stream, serving, all)
+# ==============================================================================
+services:
+  api:
+    profiles: ["batch", "gold", "stream", "serving", "all"]
+    image: music-api:local
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: music_api
+    env_file:
+      - .env
+    environment:
+      GOLD_MINIO_ENDPOINT: ${GOLD_MINIO_ENDPOINT:-minio:9000}
+      REDIS_URL: redis://redis:6379/${STREAM_REDIS_DB:-2}
+      HBASE_HOST: hbase
+    command:
+      - python
+      - -m
+      - api.server
+      - --redis-url
+      - redis://redis:6379/${STREAM_REDIS_DB:-2}
+      - --hbase-host
+      - hbase
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${API_PORT:-8001}:8000"
+    depends_on:
+      minio:
+        condition: service_started
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
+      stream-init:
+        condition: service_completed_successfully
+        required: false
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - music-net
+
+  dashboard:
+    profiles: ["batch", "gold", "stream", "serving", "all"]
+    image: music-ui:local
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    container_name: music_dashboard
+    environment:
+      MUSIC_API_URL: http://api:8000
+      DASHBOARD_DEFAULT_VIEW: ${DASHBOARD_DEFAULT_VIEW:-}
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - music-net

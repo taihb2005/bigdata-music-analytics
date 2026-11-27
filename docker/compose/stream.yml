@@ -1,0 +1,199 @@
+# ==============================================================================
+# Pipeline Stream (Speed Layer): Spark Structured Streaming, Replay & Legacy
+# ==============================================================================
+services:
+  stream-init:
+    profiles: ["stream", "legacy", "all"]
+    image: music-stream:local
+    build:
+      context: .
+      dockerfile: docker/stream.Dockerfile
+    container_name: stream_init
+    command:
+      - python
+      - stream/bootstrap/init_stream_resources.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+    depends_on:
+      kafka:
+        condition: service_healthy
+      hbase:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - music-net
+
+  spark-speed-layer:
+    profiles: ["stream", "all"]
+    image: music-spark-speed:local
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    container_name: spark_speed_layer
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[*]
+      - --conf
+      - spark.jars.ivy=/tmp/.ivy2
+      - --conf
+      - spark.executorEnv.PYTHONPATH=/opt/app
+      - --packages
+      - org.apache.spark:spark-sql-kafka-0-10_2.13:4.2.0
+      - /opt/app/stream/processing/spark_speed_layer.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --topic
+      - events.bronze.lastfm,events.demo.lastfm
+      - --starting-offsets
+      - earliest
+      - --max-offsets-per-trigger
+      - "2000"
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/${STREAM_REDIS_DB:-2}
+      - --checkpoint
+      - /opt/app/dataset/state/spark-speed-layer-v5
+    volumes:
+      - .:/opt/app
+    environment:
+      PYTHONPATH: /opt/app
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 3g
+    networks:
+      - music-net
+
+  replay:
+    profiles: ["replay"]
+    image: music-stream:local
+    build:
+      context: .
+      dockerfile: docker/stream.Dockerfile
+    command:
+      - python
+      - stream/producer/replay_scrobbles.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --topic
+      - events.demo.lastfm
+      - --file
+      - /app/dataset/sample/scrobbles.jsonl
+      - --rate
+      - ${REPLAY_RATE:-50}
+    volumes:
+      - ./dataset/sample:/app/dataset/sample:ro
+    depends_on:
+      stream-init:
+        condition: service_completed_successfully
+        required: false
+    restart: "no"
+    networks:
+      - music-net
+
+  # Các thành phần định dạng cũ (chỉ bật khi cần qua --profile legacy)
+  scrobble-producer:
+    profiles: ["legacy"]
+    image: music-stream:local
+    build:
+      context: .
+      dockerfile: docker/stream.Dockerfile
+    container_name: scrobble_producer
+    command:
+      - python
+      - stream/producer/produce_scrobbles.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --redis-url
+      - redis://redis:6379/${STREAM_REDIS_DB:-2}
+      - --statuses
+      - A
+      - --min-interval
+      - "60"
+      - --max-interval
+      - "900"
+      - --limit
+      - "50"
+    env_file:
+      - .env
+    volumes:
+      - ./dataset/state:/app/dataset/state
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - music-net
+
+  metadata-worker:
+    profiles: ["legacy"]
+    image: music-stream:local
+    build:
+      context: .
+      dockerfile: docker/stream.Dockerfile
+    container_name: metadata_worker
+    command:
+      - python
+      - stream/metadata/metadata_worker.py
+      - --redis-url
+      - redis://redis:6379/${STREAM_REDIS_DB:-2}
+      - --max-poll-interval-ms
+      - "1200000"
+      - --kafka-bootstrap
+      - kafka:9094
+      - --api-key
+      - ${LASTFM_API_KEY}
+      - --max-rps
+      - ${LASTFM_MAX_RPS:-1.0}
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - music-net
+
+  metadata-sink:
+    profiles: ["legacy"]
+    image: music-stream:local
+    build:
+      context: .
+      dockerfile: docker/stream.Dockerfile
+    container_name: metadata_sink
+    command:
+      - python
+      - stream/metadata/metadata_sink.py
+      - --bootstrap-servers
+      - kafka:9094
+      - --hbase-host
+      - hbase
+      - --redis-url
+      - redis://redis:6379/${STREAM_REDIS_DB:-2}
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      stream-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    mem_limit: 256m
+    networks:
+      - music-net
