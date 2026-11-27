@@ -1,0 +1,6 @@
+**
+!batch/
+!batch/__init__.py
+!batch/gold/
+!batch/gold/*.py
+!batch/gold/requirements*.txt

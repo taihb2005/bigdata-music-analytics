@@ -230,10 +230,7 @@ services:
     build:
       context: .
       dockerfile: docker/python-stream/Dockerfile
-      target: gold-api
     container_name: stream_api
-    environment:
-      GOLD_MINIO_ENDPOINT: ${GOLD_MINIO_ENDPOINT:-minio:9000}
     command:
       - python
       - stream/api/server.py
@@ -252,24 +249,6 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     mem_limit: 256m
-    networks:
-      - data-net
-      - bigdata-common-net
-
-  gold-worker:
-    extends:
-      file: compose.gold.yml
-      service: gold-worker
-    environment:
-      GOLD_SILVER_PATH: ${GOLD_SILVER_PATH:-${SILVER_BASE_PATH:-data/delta/silver}/fact_listen}
-      GOLD_MINIO_ENDPOINT: ${GOLD_MINIO_ENDPOINT:-minio:9000}
-    networks:
-      - bigdata-common-net
-
-  dashboard:
-    extends:
-      file: compose.gold.yml
-      service: dashboard
     networks:
       - data-net
 

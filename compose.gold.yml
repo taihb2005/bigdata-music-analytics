@@ -13,11 +13,9 @@ services:
   api:
     build:
       context: .
-      dockerfile: docker/python-stream/Dockerfile
-      target: gold-api
+      dockerfile: docker/gold/Dockerfile
+      target: api
     env_file: [.env]
-    command: ["python", "-m", "stream.api.server", "--redis-url", "redis://host.docker.internal:6379/0",
-              "--hbase-host", "host.docker.internal"]
     ports: ["127.0.0.1:8001:8000"]
     restart: unless-stopped
   dashboard:
@@ -27,7 +25,6 @@ services:
       target: dashboard
     environment:
       MUSIC_API_URL: http://api:8000
-      DASHBOARD_DEFAULT_VIEW: gold
     ports: ["127.0.0.1:8501:8501"]
     depends_on: [api]
     restart: unless-stopped

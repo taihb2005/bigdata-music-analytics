@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -78,70 +77,10 @@ def format_epoch(value) -> str:
         return str(value)
 
 
-GOLD_LABELS = {
-    "hour_distribution": "Giờ nghe (UTC)", "weekday_distribution": "Thứ trong tuần",
-    "month_distribution": "Tháng trong năm", "day_type_distribution": "Ngày thường và cuối tuần",
-    "day_comparison": "Lượt nghe trên ngày hoạt động", "weekly_trend": "Xu hướng theo tuần",
-    "hour_tags": "Tag theo giờ UTC", "user_coverage": "Độ phủ theo người nghe",
-    "listening_sessions": "Phiên nghe",
-}
-
-
-def gold_dashboard(base):
-    st.title("Thói quen nghe nhạc · Batch Gold")
-    refresh = st.button("Làm mới kết quả Gold", help="Đọc lần xuất hoàn tất mới nhất từ API")
-    if refresh or st.session_state.get("gold_api") != base or "gold_manifest" not in st.session_state:
-        manifest, error = get_json(base, "batch/gold")
-        if error:
-            st.info(error)
-            return
-        st.session_state.gold_api = base
-        st.session_state.gold_manifest = manifest
-    manifest = st.session_state.gold_manifest
-    source = manifest["source"]
-    st.caption(f"Hoàn tất {manifest['completed_at_utc']} · UTC")
-    a, b, c = st.columns(3)
-    a.metric("Lượt nghe", f"{source['rows']:,}")
-    b.metric("Phiên bản Silver", source["version"])
-    c.metric("Bảng đã xuất", len(manifest["tables"]))
-    table = st.selectbox("Phân tích", list(GOLD_LABELS), format_func=GOLD_LABELS.get)
-    total = manifest["tables"][table]["rows"]
-    size = 100
-    pages = max(1, (total + size - 1) // size)
-    page = st.number_input("Trang", min_value=1, max_value=pages, step=1,
-                           key=f"gold_page_{manifest['run_id']}_{table}") if pages > 1 else 1
-    data, error = get_json(base, f"batch/gold/{table}", {
-        "run_id": manifest["run_id"], "offset": (page-1)*size, "limit": size})
-    if error:
-        st.warning(error)
-        return
-    if not data["rows"]:
-        st.info("Bảng này chưa có dữ liệu.")
-        return
-    frame = pd.DataFrame(data["rows"])
-    axis = {"hour_distribution": "gio_utc", "weekday_distribution": "thu_iso",
-            "month_distribution": "thang", "day_type_distribution": "loai_ngay"}
-    if table in axis:
-        st.caption("Tỷ trọng lượt nghe trung bình theo người dùng (%)")
-        st.bar_chart(frame, x=axis[table], y="share_pct")
-    elif table == "weekly_trend":
-        st.line_chart(frame.sort_values("tuan_utc"), x="tuan_utc", y="share_pct")
-    st.caption(f"Trang {page}/{pages} · {total:,} dòng")
-    st.dataframe(frame, use_container_width=True, hide_index=True)
-
-
 with st.sidebar:
     st.markdown("## 🎧 Music Analytics")
     st.caption("Bảng điều khiển dữ liệu nghe nhạc")
-    api_url = st.text_input("Địa chỉ API", value=os.getenv("MUSIC_API_URL", "http://localhost:8001"))
-    view = st.radio("Nguồn dữ liệu", ["Trực tuyến", "Batch Gold"],
-                    index=1 if os.getenv("DASHBOARD_DEFAULT_VIEW") == "gold" else 0)
-
-if view == "Batch Gold":
-    gold_dashboard(api_url.strip())
-    st.stop()
-
-with st.sidebar:
+    api_url = st.text_input("Địa chỉ API", value="http://localhost:8001")
     username = st.text_input("Last.fm username", value="Mudduck", placeholder="Ví dụ: Mudduck")
     windows = ["5m", "15m", "1h", "6h", "24h"]
     track_window = st.selectbox("Top bài hát · cửa sổ", windows, index=2)

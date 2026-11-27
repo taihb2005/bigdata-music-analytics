@@ -94,29 +94,6 @@ Spark **chỉ đọc Kafka** (`events.bronze.lastfm`, `events.demo.lastfm`) rồ
 
 Phần này chỉ áp dụng cho event định dạng cũ có `source=lastfm` (message batch đã kèm metadata). Mặc định artist, track, album là yêu cầu **dùng chung** (không truyền `username` cho Last.fm): cùng một bài do nhiều user nghe chỉ tốn một request. `userplaycount` theo từng user chỉ lấy khi chạy Spark với `--per-user-stats` (mỗi cặp user × mục một request, rất tốn). Lỗi tạm thời được thử lại có backoff, lỗi vĩnh viễn không thử lại, và lỗi 29 không bị đưa vào dead-letter. Yêu cầu vào dead-letter được ghi `failed` và **không bị gửi lại trong `--failure-backoff`** (mặc định 6 giờ) dù bài đó được nghe lại.
 
-## Batch Gold · Thói quen nghe nhạc
-
-Nếu Silver đã có trên MinIO, chạy lệnh sau từ thư mục dự án. Docker khởi động worker, API và dashboard.
-
-```powershell
-docker compose -f compose.gold.yml up -d --build
-docker compose -f compose.gold.yml logs --tail 20 gold-worker
-```
-
-Worker dùng endpoint và thông tin đăng nhập MinIO trong `.env`, đọc bảng Delta `s3a://silver/fact_listen` và xuất Parquet vào `s3a://gold/batch_analysis/<run_id>/`. Nó kiểm tra Silver ngay khi khởi động và sau mỗi 900 giây. Chỉnh `GOLD_INTERVAL_SECONDS` để đổi chu kỳ. Khi phiên bản Silver đã được xử lý, worker bỏ qua lần xuất. Nếu ghi bảng bị gián đoạn, API tiếp tục phục vụ lần xuất hoàn tất trước đó và worker thử lại ở chu kỳ sau.
-
-Trong [dashboard](http://localhost:8501), chọn **Batch Gold** và chọn bảng phân tích. Có chín bảng về độ phủ theo user, phân bố theo giờ UTC, thứ, tháng, loại ngày, so sánh ngày thường/cuối tuần, phiên nghe, xu hướng tuần và tag theo giờ UTC. Các bảng dài có phân trang. Nút **Làm mới kết quả Gold** chuyển sang lần xuất hoàn tất mới nhất.
-
-API trả danh sách bảng, số dòng, thời gian hoàn tất và phiên bản Silver tại [bản xuất Gold mới nhất](http://localhost:8001/batch/gold). Ví dụ sau đọc bảng phiên nghe từ cùng một lần xuất. Dùng `next_offset` cho trang tiếp theo cho đến khi giá trị là `null`. Mỗi yêu cầu nhận từ 1 đến 1.000 dòng.
-
-```powershell
-$gold = Invoke-RestMethod 'http://localhost:8001/batch/gold'
-$page = Invoke-RestMethod "http://localhost:8001/batch/gold/listening_sessions?run_id=$($gold.run_id)&offset=0&limit=100"
-$page.rows
-```
-
-Nếu đã vận hành toàn bộ dự án bằng Compose gốc, dùng `docker compose up -d --build gold-worker api dashboard` trong cùng project. Cấu hình này đọc `data/delta/silver/fact_listen` từ volume dùng chung với Silver và ghi Gold qua `minio:9000`. Để dùng Silver trên MinIO từ xa, đặt `GOLD_SILVER_PATH=s3a://silver/fact_listen` và `GOLD_MINIO_ENDPOINT` bằng endpoint API MinIO truy cập được từ container. Hai cấu hình Compose dùng chung cổng host 8001 và 8501, nên chọn một cấu hình để chạy.
-
 ## API
 
 ```bash
@@ -161,7 +138,6 @@ tests/               test_bronze_event.py (message batch), test_pipeline.py, tes
 
 ```bash
 pip install -r batch/requirements.txt                     # test của batch cần celery, jsonschema, minio, ...
-pip install -r batch/gold/requirements.txt                # Delta, Parquet và SQL cho kiểm thử Gold
 python -m unittest discover -s tests -t .                 # không cần Docker; test Spark tự bỏ qua nếu thiếu pyspark
 docker compose up -d redis
 python -m unittest tests.test_integration_redis -v        # chạy CHÍNH đoạn Lua trên Redis thật (db 15, bị xóa sạch)

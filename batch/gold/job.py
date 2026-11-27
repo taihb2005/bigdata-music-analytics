@@ -12,7 +12,7 @@ from deltalake import DeltaTable
 from .analytics import QUERIES, prepare
 
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 
 
 def refresh(store):
