@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from functools import cached_property
+from functools import cached_property, lru_cache
+from io import BytesIO
 
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
@@ -33,11 +34,26 @@ class GoldStore(GoldCatalog):
             return {"path": f"s3a://{self.bucket}/{self.key(run, name)}", "rows": remote.metadata.num_rows,
                     "schema": {"type": "struct", "fields": fields}}
 
+    @lru_cache(maxsize=32)
+    def _daily_table(self, run, table):
+        # The daily worker writes one small part per table (at most 7 x 24 rows).
+        obj = self.client.get_object(self.bucket, self.key(run, f"{table}/part-00000.parquet"))
+        try:
+            return pq.read_table(BytesIO(obj.read()))
+        finally:
+            obj.close()
+            obj.release_conn()
+
     def page(self, manifest, table, offset, limit):
         run = manifest["run_id"]
         total = manifest["tables"][table]["rows"]
         rows = []
-        if offset < total:
+        if offset < total and manifest.get("pipeline_version") == 2:
+            data = self._daily_table(run, table)
+            if data.num_rows != total:
+                raise IOError("Published Gold table does not match its manifest")
+            rows = data.slice(offset, limit).to_pylist()
+        elif offset < total:
             skip = offset
             prefix = self.key(run, table + "/")
             for item in self.client.list_objects(self.bucket, prefix=prefix, recursive=True):

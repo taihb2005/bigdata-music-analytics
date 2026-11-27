@@ -13,6 +13,9 @@ from minio.error import S3Error
 
 
 TABLES = (
+    "hour_distribution", "weekday_distribution", "weekday_hour_distribution", "day_type_distribution", "day_comparison",
+)
+LEGACY_TABLES = (
     "user_coverage", "hour_distribution", "weekday_distribution", "month_distribution",
     "day_type_distribution", "day_comparison", "listening_sessions", "weekly_trend", "hour_tags",
 )
@@ -84,7 +87,7 @@ class GoldCatalog:
             response.close()
             response.release_conn()
         if (data.get("status") != "succeeded" or data.get("run_id") != run
-                or set(data.get("tables", {})) != set(TABLES)):
+                or set(data.get("tables", {})) not in (set(TABLES), set(LEGACY_TABLES))):
             return None
         return data
 
@@ -99,7 +102,7 @@ class GoldCatalog:
             raise
         for run in sorted(runs, reverse=True):
             manifest = self.manifest(run)
-            if manifest:
+            if manifest and set(manifest["tables"]) == set(TABLES):
                 return manifest
         return None
 

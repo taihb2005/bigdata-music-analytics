@@ -13,12 +13,10 @@ Last.fm ── producer batch (Celery, mỗi giờ) ──► Kafka events.bronz
               ▼                                                         ▼                            ▼
    HBase: event thô, fact_listen,                        Redis (DB 2): khử trùng event_id,           │
    snapshot theo user/ngày                               thống kê user, top-K 5 phút → 24 giờ        │
-              │                                                         │                            │
-              └────────────────────────────┬────────────────────────────┴────────────────────────────┘
-                                           ▼
-                                  API HTTP (api/server.py)
-                                           │
-                                  Dashboard Streamlit (ui/app.py)
+                                                                                                     ▼
+                                                                                          API HTTP Batch Gold
+                                                                                                     │
+                                                                                          Dashboard Streamlit
 ```
 
 ---
@@ -93,7 +91,7 @@ docker compose --profile replay run --rm replay python stream/producer/replay_sc
 
 ## 3. Truy cập Dashboard & HTTP API
 
-* **Dashboard Streamlit:** `http://localhost:8501` — chuyển đổi giữa **Trực tuyến** (Stream) và **Batch Gold** ở thanh bên.
+* [Dashboard Batch Gold](http://localhost:8501) mở mục **Giờ và thứ trong tuần**, gồm 24 giờ UTC, bảy thứ và biểu đồ nhiệt 7 × 24. Mục **Ngày thường và cuối tuần** so sánh hai loại ngày. Bấm **Làm mới kết quả Gold** để đọc lần xuất hoàn tất mới nhất.
 * **Endpoints của HTTP API (`http://localhost:8001`):**
 
 ```powershell
@@ -102,21 +100,14 @@ Invoke-RestMethod 'http://localhost:8001/health'
 
 # Batch Gold: lấy manifest mới nhất và đọc bảng phân trang (limit 1..1000)
 $gold = Invoke-RestMethod 'http://localhost:8001/batch/gold'
-$page = Invoke-RestMethod "http://localhost:8001/batch/gold/listening_sessions?run_id=$($gold.run_id)&offset=0&limit=100"
+$page = Invoke-RestMethod "http://localhost:8001/batch/gold/weekday_hour_distribution?run_id=$($gold.run_id)&limit=168"
 $page.rows
-
-# Stream: thống kê user, xu hướng, lịch sử HBase và bảng xếp hạng toàn hệ thống
-curl "http://localhost:8001/users/<username>/analytics?top=10&recent=10"
-curl "http://localhost:8001/users/<username>/trend?n=20"
-curl "http://localhost:8001/users/<username>/events?limit=20"
-curl "http://localhost:8001/global/top?kind=tracks&window=1h&k=10"
-python stream/tools/show_user_analytics.py <username>
 ```
 
 Nếu muốn chạy API hoặc Dashboard trực tiếp bằng Python trên máy local:
 ```powershell
 pip install -r requirements/api.txt -r requirements/ui.txt
-python -m api
+python -m api --port 8001
 python -m streamlit run ui/app.py
 ```
 
@@ -130,7 +121,7 @@ batch/               Pipeline Batch: bronze (producer, consumer), silver (Delta 
                      datalake (MinIO client), scheduler (Celery Beat & Worker)
 stream/              Pipeline Speed: processing (Spark & lõi pipeline), storage (Redis, HBase),
                      producer (replay & legacy), metadata (legacy), bootstrap, tools
-api/                 HTTP Serving API chỉ đọc (kết nối MinIO Gold + Redis + HBase)
+api/                 Điểm khởi chạy API đọc kết quả Batch Gold từ MinIO
 ui/                  Giao diện Streamlit Dashboard (ui/app.py)
 docker/              Tập trung toàn bộ *.Dockerfile theo từng pipeline và các file docker/compose/*.yml
 requirements/        Khai báo thư viện tách theo dịch vụ (common, batch, gold, stream, api, ui, dev)

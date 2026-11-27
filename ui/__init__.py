@@ -1,1 +1,1 @@
-"""Package giao diện Dashboard Streamlit dùng chung cho cả Batch Gold và Stream."""
+"""Điểm khởi chạy dashboard cho các bảng Batch Gold đã xuất."""

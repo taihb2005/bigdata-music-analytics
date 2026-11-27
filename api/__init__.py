@@ -1,13 +1,7 @@
-"""Package Serving API dùng chung cho cả luồng Batch Gold và Stream."""
+"""Gold serving API with backward-compatible reader imports."""
 from __future__ import annotations
 
-from api.server import (
-    AnalyticsReader,
-    ApiError,
-    PooledHBaseReader,
-    main,
-    make_handler,
-)
+from importlib import import_module
 
 __all__ = [
     "AnalyticsReader",
@@ -16,3 +10,11 @@ __all__ = [
     "main",
     "make_handler",
 ]
+
+
+def __getattr__(name):
+    if name == "main":
+        return import_module("batch.gold.api").main
+    if name in __all__:
+        return getattr(import_module("api.server"), name)
+    raise AttributeError(name)

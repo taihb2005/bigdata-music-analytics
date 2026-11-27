@@ -1,14 +1,7 @@
-"""API HTTP chỉ đọc phục vụ cả Batch Gold (MinIO) và Speed Layer (Redis, HBase).
+"""Start the Gold HTTP API with python -m api.server.
 
-  GET /health
-  GET /batch/gold                                     bản xuất Gold hoàn tất mới nhất
-  GET /batch/gold/<table>?run_id=<id>&offset=0&limit=100
-  GET /users/<username>/analytics?top=10&recent=10   thống kê của user (Redis)
-  GET /users/<username>/trend?n=20                   xu hướng N lượt nghe gần nhất (Redis)
-  GET /users/<username>/events?limit=20              scrobble mới nhất (HBase)
-  GET /global/top?kind=tracks|artists|albums&window=5m|15m|1h|6h|24h&k=10[&end=<epoch>]
-
-Không có `end` thì "bây giờ" là bucket mới nhất có dữ liệu (đúng khi replay dữ liệu cũ).
+The reader, handler and main function exported to stream.api.server retain
+the legacy stream interface. The serving command starts batch.gold.api.
 """
 from __future__ import annotations
 
@@ -26,8 +19,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from common.ids import user_key
-from stream.processing.realtime_store import WINDOWS
-from stream.storage.redis_reader import read_global, read_user_analytics, read_user_trend
 
 
 class ApiError(Exception):
@@ -99,6 +90,8 @@ class AnalyticsReader:
         if parts[:2] == ["batch", "gold"]:
             return self.gold_result(parts[2:], query)
         if len(parts) == 3 and parts[0] == "users":
+            from stream.storage.redis_reader import read_user_analytics, read_user_trend
+
             username = parts[1]
             if parts[2] == "analytics":
                 data = self._call_redis(
@@ -124,6 +117,9 @@ class AnalyticsReader:
                 raise ApiError(404, f"Chưa có dữ liệu cho user {username}")
             return data
         if parts == ["global", "top"]:
+            from stream.processing.realtime_store import WINDOWS
+            from stream.storage.redis_reader import read_global
+
             kind = query.get("kind", ["tracks"])[0]
             window = query.get("window", ["1h"])[0]
             if kind not in {"tracks", "artists", "albums"}:
@@ -234,4 +230,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    from batch.gold.api import main as serve_gold
+
+    serve_gold()
