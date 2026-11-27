@@ -1,4 +1,9 @@
 .git
+.venv
+data
+tmp
+reports
+notebooks
 .env
 **/__pycache__
 *.pyc

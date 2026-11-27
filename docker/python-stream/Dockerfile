@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
@@ -13,3 +13,11 @@ COPY stream /app/stream
 COPY dataset/users /app/dataset/users
 
 ENV PYTHONUNBUFFERED=1
+
+FROM base AS gold-api
+COPY batch/gold/requirements-api.txt /tmp/gold-api.txt
+RUN pip install --no-cache-dir -r /tmp/gold-api.txt
+COPY batch/__init__.py /app/batch/__init__.py
+COPY batch/gold /app/batch/gold
+
+FROM base AS stream

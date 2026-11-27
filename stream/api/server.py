@@ -1,6 +1,8 @@
 """API HTTP chỉ đọc cho kết quả của speed layer (chỉ dùng thư viện chuẩn).
 
   GET /health
+  GET /batch/gold                                     bản xuất Gold hoàn tất mới nhất
+  GET /batch/gold/<table>?run_id=<id>&offset=0&limit=100
   GET /users/<username>/analytics?top=10&recent=10   thống kê của user (Redis)
   GET /users/<username>/trend?n=20                   xu hướng N lượt nghe gần nhất (Redis)
   GET /users/<username>/events?limit=20              scrobble mới nhất (HBase)
@@ -74,15 +76,18 @@ class PooledHBaseReader:
 class AnalyticsReader:
     """Gom các lần đọc Redis/HBase thành các hàm trả về dict (tách khỏi HTTP để test)."""
 
-    def __init__(self, redis_client, store=None, clock=time.time) -> None:
+    def __init__(self, redis_client, store=None, clock=time.time, gold_store=None) -> None:
         self.redis = redis_client
         self.store = store
         self.clock = clock
+        self.gold = gold_store
 
     def route(self, path: str, query: dict[str, list[str]]):
         parts = [unquote(part) for part in path.strip("/").split("/") if part]
         if parts == ["health"]:
             return {"status": "ok", "hbase": self.store is not None}
+        if parts[:2] == ["batch", "gold"]:
+            return self.gold_result(parts[2:], query)
         if len(parts) == 3 and parts[0] == "users":
             username = parts[1]
             if parts[2] == "analytics":
@@ -117,6 +122,29 @@ class AnalyticsReader:
             return read_global(self.redis, kind, window, k=_int_param(query, "k", 10, 1, 100), end_epoch=end,
                                now=self.clock())
         raise ApiError(404, "Không có đường dẫn này")
+
+    def gold_result(self, parts, query):
+        if self.gold is None:
+            raise ApiError(503, "API chưa cấu hình kho Gold")
+        from batch.gold.catalog import RUN_ID, TABLES
+
+        if len(parts) > 1 or (parts and parts[0] not in TABLES):
+            raise ApiError(404, "Không có bảng Gold này")
+        run = query.get("run_id", [None])[0]
+        if run is not None and not RUN_ID.fullmatch(run):
+            raise ApiError(400, "run_id không hợp lệ")
+        limit = _int_param(query, "limit", 100, 1, 1000)
+        offset = _int_param(query, "offset", 0, 0, 2**63-1)
+        try:
+            manifest = self.gold.manifest(run) if run else self.gold.latest()
+            if manifest is None:
+                raise ApiError(404, "Chưa có lần xuất Gold hoàn tất" if not run else "Không tìm thấy lần xuất Gold")
+            return self.gold.page(manifest, parts[0], offset, limit) if parts else manifest
+        except ApiError:
+            raise
+        except Exception as exc:
+            print(f"Gold storage error: {type(exc).__name__}", file=sys.stderr)
+            raise ApiError(503, "Chưa đọc được dữ liệu Gold từ MinIO") from exc
 
 
 def make_handler(reader: AnalyticsReader):
@@ -169,7 +197,15 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"Không dùng được HBase ({exc}); /events sẽ trả 503.")
         store = None
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(AnalyticsReader(redis_client, store)))
+    gold = None
+    try:
+        from batch.gold.catalog import Settings
+        from batch.gold.parquet import GoldStore
+
+        gold = GoldStore(Settings.from_env())
+    except (ImportError, ValueError) as exc:
+        print(f"Gold API chưa sẵn sàng ({type(exc).__name__})", file=sys.stderr)
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(AnalyticsReader(redis_client, store, gold_store=gold)))
     print(f"API nghe ở http://{args.host}:{args.port}")
     try:
         server.serve_forever()
