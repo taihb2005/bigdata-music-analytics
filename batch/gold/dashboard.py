@@ -57,6 +57,170 @@ def gold_bars(frame, axis, order):
     st.altair_chart(chart.properties(height=225), use_container_width=True)
 
 
+GENRE_REPORTS = {
+    "global_genre": "Gu chung của cả nhóm",
+    "user_genre_top": "Top 10 thể loại của mỗi người",
+    "genre_diversity": "Mức đa dạng của từng người",
+    "genre_by_hour": "Thể loại theo giờ và thứ",
+    "genre_similarity": "Độ giống nhau giữa hai người",
+    "genre_pairs": "Các tag thường đi cùng nhau",
+}
+
+
+def move_genre_page(step):
+    st.session_state.genre_offset += step
+
+
+def genre_bars(frame, label, value, tooltip, domain=None):
+    labels = frame[label].tolist()
+    chart = alt.Chart(frame).mark_bar(color="#157a79", cornerRadiusEnd=3).encode(
+        y=alt.Y(label, type="nominal", sort=labels, title=None,
+                axis=alt.Axis(values=labels, labelOverlap=False)),
+        x=alt.X(value, type="quantitative", scale=alt.Scale(domain=domain) if domain else alt.Scale(zero=True)),
+        tooltip=tooltip,
+    )
+    st.altair_chart(chart.properties(height=max(90, 26 * len(frame))), use_container_width=True)
+
+
+def group_genre_chart(frame, offset=0):
+    visible = frame.head(12).rename(columns={
+        "tag": "Thể loại", "share_pct_tb": "Tỷ lệ trung bình (%)", "so_user": "Số người nghe",
+    })
+    st.caption(f"Thể loại hạng {offset + 1}–{offset + len(visible)} của nhóm. "
+               "Mỗi người có tag đóng góp cùng trọng số vào tỷ lệ trung bình.")
+    genre_bars(visible, "Thể loại", "Tỷ lệ trung bình (%)", list(visible.columns))
+
+
+def genre_calendar(frame, hourly, measure):
+    dimension = "gio_utc" if hourly else "thu_iso"
+    period = "Giờ UTC" if hourly else "Thứ (UTC)"
+    order = list(range(24)) if hourly else WEEKDAYS
+    tags = frame.sort_values("hang")["tag"].drop_duplicates().tolist()
+    frame = frame.rename(columns={dimension: period, "tag": "Thể loại", "luot_quy_doi": "Lượt quy đổi",
+                                  "share_pct": "Tỷ lệ trong khung (%)"})
+    if not hourly:
+        frame[period] = frame[period].map(dict(enumerate(WEEKDAYS, 1)))
+    st.caption(f"{len(tags)} thể loại đứng đầu của nhóm. Tỷ lệ tính trên lượt quy đổi của các thể loại này "
+               "trong cùng khung giờ hoặc thứ. Ô tỷ lệ để trống khi tổng lượt quy đổi bằng 0.")
+    chart = alt.Chart(frame).mark_rect().encode(
+        x=alt.X(period, type="ordinal", sort=order, axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("Thể loại:N", sort=tags, title=None, axis=alt.Axis(values=tags, labelOverlap=False)),
+        color=alt.Color(measure, type="quantitative", scale=alt.Scale(scheme="tealblues")),
+        tooltip=[alt.Tooltip(period, type="ordinal"), "Thể loại:N",
+                 alt.Tooltip("Lượt quy đổi:Q", format=",.2f"),
+                 alt.Tooltip("Tỷ lệ trong khung (%):Q", format=".1f")],
+    )
+    st.altair_chart(chart.properties(height=max(95, len(tags) * 32)), use_container_width=True)
+    with st.expander("Xem số liệu theo từng khung"):
+        st.dataframe(frame.pivot(index=period, columns="Thể loại", values=measure)
+                     .reindex(index=order, columns=tags).round(2))
+
+
+def genre_dashboard(base, manifest):
+    if "global_genre" not in manifest["tables"]:
+        st.info("Bản Gold đang xem chỉ có thống kê theo ngày. Bấm làm mới sau khi worker xuất số liệu thể loại.")
+        return
+    source = manifest["source"]
+    st.caption(f"{source['tagged_rows']:,}/{source['rows']:,} lượt có tag · {source['tagged_users']:,} người có tag. "
+               "Mỗi lượt có nhiều tag được chia đều trọng số giữa các tag.")
+    if not source["tagged_rows"]:
+        st.info("Chưa có lượt nghe có tag trong bản Silver này.")
+        return
+    table = st.selectbox("Phân tích thể loại", list(GENRE_REPORTS), format_func=GENRE_REPORTS.get)
+    params = {"run_id": manifest["run_id"]}
+    if table in ("user_genre_top", "genre_diversity", "genre_similarity"):
+        user = st.text_input("Lọc theo user_id", placeholder="Để trống để xem tất cả").strip()
+        if user:
+            params["user_id"] = user
+            if table == "genre_similarity":
+                peer = st.text_input("So với user_id", placeholder="Để trống để xem tất cả cặp có chung tag").strip()
+                if peer:
+                    params["peer"] = peer
+    calendar = table == "genre_by_hour"
+    if calendar:
+        if st.radio("Khung thời gian (UTC)", ["Giờ", "Thứ"], horizontal=True) == "Thứ":
+            table = "genre_by_weekday"
+        measure = st.radio("Đơn vị", ["Lượt quy đổi", "Tỷ lệ trong khung (%)"], horizontal=True)
+    scope = (table, tuple(params.items()))
+    if st.session_state.get("genre_scope") != scope:
+        st.session_state.genre_scope = scope
+        st.session_state.genre_offset = 0
+    size = 192 if calendar else 50
+    offset = st.session_state.genre_offset
+    data, error = get_json(base, f"batch/gold/{table}", dict(params, offset=offset, limit=size))
+    if error:
+        st.warning(error)
+        return
+    if not data["rows"]:
+        if table == "genre_similarity":
+            st.info("Không tìm thấy cặp người nghe có tag chung với lựa chọn hiện tại.")
+        else:
+            st.info("Không có dữ liệu phù hợp.")
+        return
+    frame = pd.DataFrame(data["rows"])
+    if calendar:
+        genre_calendar(frame, table == "genre_by_hour", measure)
+        return
+
+    details = {
+        "user_genre_top": "Tỷ lệ tính trên các lượt có tag của từng người. Số lượt có tag đếm mỗi lượt một lần cho mỗi tag.",
+        "genre_diversity": "Mỗi điểm là một người nghe trên trang này. Entropy bằng 0 khi chỉ nghe một tag và tăng khi lượt nghe phân bố đều hơn giữa nhiều tag.",
+        "genre_similarity": "Cosine gần 1 cho biết hai phân bố tag giống nhau. Tag phổ biến như rock có thể làm điểm cao. Bảng liệt kê mỗi cặp có tag chung một lần.",
+        "genre_pairs": "Mỗi cặp tag được đếm một lần trên mỗi lượt nghe. Nhãn trên cạnh là số lượt mang cả hai tag.",
+    }
+    if table in details:
+        st.caption(details[table])
+    if table == "global_genre":
+        group_genre_chart(frame, offset)
+    elif table == "user_genre_top":
+        listener = st.selectbox("Người nghe trên biểu đồ", frame["user_id"].unique())
+        profile = frame.loc[frame["user_id"] == listener]
+        # A page boundary can split one listener's top ten across two pages.
+        if data["total"] > size and listener in (frame["user_id"].iloc[0], frame["user_id"].iloc[-1]):
+            result, error = get_json(base, "batch/gold/user_genre_top", dict(params, user_id=listener, limit=10))
+            if error:
+                st.warning(error)
+                profile = profile.iloc[:0]
+            else:
+                profile = pd.DataFrame(result["rows"])
+        if not profile.empty:
+            profile = profile.rename(columns={"tag": "Thể loại", "pct": "Tỷ lệ (%)", "so_luot": "Số lượt có tag"})
+            genre_bars(profile, "Thể loại", "Tỷ lệ (%)", ["Thể loại", "Tỷ lệ (%)", "Số lượt có tag"], [0, 100])
+    elif table == "genre_diversity":
+        chart = alt.Chart(frame).mark_circle(size=95, opacity=0.8).encode(
+            x=alt.X("so_the_loai:Q", title="Số thể loại", axis=alt.Axis(tickMinStep=1)),
+            y=alt.Y("entropy:Q", title="Entropy (bit)"),
+            color=alt.Color("ty_le_the_loai_so_1:Q", title="Tỷ lệ tag đứng đầu",
+                            scale=alt.Scale(domain=[0, 1], scheme="tealblues"), legend=alt.Legend(format=".0%")),
+            tooltip=[alt.Tooltip("user_id:N", title="Người nghe"), alt.Tooltip("so_the_loai:Q", title="Số thể loại"),
+                     alt.Tooltip("entropy:Q", title="Entropy (bit)", format=".2f"),
+                     alt.Tooltip("ty_le_the_loai_so_1:Q", title="Tỷ lệ tag đứng đầu", format=".1%")],
+        )
+        st.altair_chart(chart.properties(height=280), use_container_width=True)
+    elif table == "genre_similarity":
+        pairs = frame.head(12).rename(columns={"cosine": "Độ tương đồng"})
+        pairs["Cặp người nghe"] = pairs["u1"] + " ↔ " + pairs["u2"]
+        st.caption(f"Biểu đồ hiển thị {len(pairs)} cặp đầu của trang.")
+        genre_bars(pairs, "Cặp người nghe", "Độ tương đồng", ["Cặp người nghe", "Độ tương đồng"], [0, 1])
+    elif table == "genre_pairs":
+        edges = [f"{json.dumps(r.t1, ensure_ascii=False)} -- {json.dumps(r.t2, ensure_ascii=False)} "
+                 f'[label="{r.so_luot}"];' for r in frame.head(10).itertuples()]
+        st.caption("Đồ thị hiển thị tối đa 10 cặp đầu của trang.")
+        st.graphviz_chart("graph { " + " ".join(edges) + " }")
+    st.dataframe(frame.rename(columns={
+        "user_id": "Người nghe", "hang": "Hạng", "tag": "Tag", "pct": "Tỷ lệ (%)",
+        "so_luot": "Số lượt", "luot_quy_doi": "Lượt quy đổi", "so_user": "Số người",
+        "share_pct_tb": "Tỷ lệ trung bình (%)", "entropy": "Entropy (bit)", "so_the_loai": "Số tag",
+        "ty_le_the_loai_so_1": "Tỷ lệ tag số 1 (0–1)", "u1": "Người nghe 1", "u2": "Người nghe 2",
+        "cosine": "Cosine", "t1": "Tag 1", "t2": "Tag 2",
+    }), hide_index=True)
+    st.caption(f"Dòng {offset + 1}–{offset + len(frame)} trong {data['total']:,} dòng")
+    if data["total"] > size:
+        left, right = st.columns(2)
+        left.button("Trang trước", disabled=offset == 0, on_click=move_genre_page, args=(-size,))
+        right.button("Trang sau", disabled=data["next_offset"] is None, on_click=move_genre_page, args=(size,))
+
+
 def gold_dashboard(base):
     st.title("Thói quen nghe nhạc theo ngày")
     refresh = st.button("Làm mới kết quả Gold", help="Đọc lần xuất hoàn tất mới nhất từ API")
@@ -70,7 +234,10 @@ def gold_dashboard(base):
         st.session_state.gold_manifest = manifest
     source = manifest["source"]
     st.caption(f"{source['rows']:,} lượt nghe · Silver v{source['version']} · Hoàn tất {manifest['completed_at_utc']}")
-    view = st.radio("Phân tích", ["Giờ và thứ trong tuần", "Ngày thường và cuối tuần"], horizontal=True)
+    view = st.radio("Phân tích", ["Giờ và thứ trong tuần", "Ngày thường và cuối tuần", "Thể loại ưa thích"], horizontal=True)
+    if view == "Thể loại ưa thích":
+        genre_dashboard(base, manifest)
+        return
     daily = view == "Giờ và thứ trong tuần"
     tables = (["hour_distribution", "weekday_distribution", "weekday_hour_distribution"] if daily
               else ["day_type_distribution", "day_comparison"])
@@ -112,6 +279,13 @@ def gold_dashboard(base):
         with st.expander("Xem số liệu theo giờ và thứ"):
             for tab, frame in zip(st.tabs(["Theo giờ", "Theo thứ", "Theo giờ và thứ"]), (hours, days, grid)):
                 tab.dataframe(frame, hide_index=True)
+        if "global_genre" in manifest["tables"] and source.get("tagged_rows"):
+            st.subheader("Thể loại được nghe nhiều trong nhóm")
+            preview, error = get_json(base, "batch/gold/global_genre", {"run_id": manifest["run_id"], "limit": 8})
+            if error:
+                st.warning(error)
+            elif preview["rows"]:
+                group_genre_chart(pd.DataFrame(preview["rows"]))
     else:
         types = frames["day_type_distribution"].drop(columns="cuoi_tuan")
         st.subheader("Phân bố lượt nghe theo loại ngày")

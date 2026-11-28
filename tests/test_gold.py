@@ -1,5 +1,6 @@
 """Exercise the scheduled job's Delta -> Parquet contract and the real API reader."""
 import io
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -13,7 +14,7 @@ import pyarrow.fs as fs
 from deltalake import write_deltalake
 from minio.error import S3Error
 
-from batch.gold.catalog import LEGACY_TABLES, Settings, TABLES
+from batch.gold.catalog import DAILY_TABLES, LEGACY_TABLES, Settings, TABLES
 from batch.gold.job import refresh
 from batch.gold.parquet import GoldStore
 from batch.gold.api import GoldReader, ApiError
@@ -87,8 +88,9 @@ class BatchGoldTest(unittest.TestCase):
         manifest = self.reader.route("/batch/gold", {})
         self.assertEqual(manifest["source"]["version"], 1)
         self.assertEqual(manifest["source"]["rows"], 9)
-        self.assertEqual(set(manifest["tables"]), {"hour_distribution", "weekday_distribution",
-                         "weekday_hour_distribution", "day_type_distribution", "day_comparison"})
+        self.assertEqual(set(manifest["tables"]), set(TABLES))
+        self.assertEqual(manifest["source"]["tagged_users"], 0)
+        self.assertTrue(all(manifest["tables"][name]["rows"] == 0 for name in set(TABLES) - set(DAILY_TABLES)))
         self.assertEqual(refresh(self.store)["status"], "unchanged")
         for table in TABLES:
             page = self.page(table, limit=200)
@@ -113,6 +115,74 @@ class BatchGoldTest(unittest.TestCase):
             with self.assertRaises(ApiError) as error:
                 self.page("hour_distribution", **params)
             self.assertEqual(error.exception.status, 400)
+
+    def publish_tags(self, samples):
+        tags = pa.array([tags for _, _, tags in samples], type=pa.list_(pa.string()))
+        source = pa.table({
+            "event_id": [str(i) for i in range(len(samples))],
+            "user_id": [u for u, _, _ in samples],
+            "listened_at": [int(datetime(2025, 1, 6, tzinfo=timezone.utc).timestamp()) + t for _, t, _ in samples],
+            "tags": tags,
+        })
+        write_deltalake(self.silver, source, mode="overwrite", schema_mode="overwrite")
+        return refresh(self.store)
+
+    def test_genre_metrics_use_clean_tags_and_equal_user_weight(self):
+        self.publish_tags([
+            ("a", 0, ["Rock", " rock ", " Pop ", "", None]), ("a", 0, ["rock"]), ("a", 3600, ["rock"]),
+            ("a", 0, []), ("b", 0, ["pop"]), ("c", 6 * 86400, ["jazz"]), ("d", 0, None),
+        ])
+        source = self.store.latest()["source"]
+        self.assertEqual((source["rows"], source["tagged_rows"], source["tagged_users"]), (7, 5, 3))
+        ranked = self.page("user_genre_top", user_id="a")
+        self.assertEqual([(r["hang"], r["tag"], r["pct"], r["so_luot"], r["luot_quy_doi"]) for r in ranked["rows"]],
+                         [(1, "rock", 83.3, 3, 2.5), (2, "pop", 16.7, 1, 0.5)])
+        self.assertEqual([(r["tag"], r["share_pct_tb"], r["so_user"]) for r in self.page("global_genre")["rows"]],
+                         [("pop", 38.89, 2), ("jazz", 33.33, 1), ("rock", 27.78, 1)])
+        diversity = self.page("genre_diversity", user_id="a")["rows"][0]
+        self.assertAlmostEqual(diversity["entropy"], -sum(p * math.log2(p) for p in (5/6, 1/6)))
+        self.assertEqual(diversity["so_the_loai"], 2)
+        self.assertAlmostEqual(diversity["ty_le_the_loai_so_1"], 5/6)
+        self.assertFalse(self.page("genre_diversity", user_id="d")["rows"])
+        hours = self.page("genre_by_hour", limit=192)["rows"]
+        self.assertEqual(len(hours), 24*3)
+        self.assertEqual(sum(r["luot_quy_doi"] for r in hours), 5)
+        self.assertEqual(next(r["share_pct"] for r in hours if r["gio_utc"] == 0 and r["tag"] == "pop"), 37.5)
+        self.assertTrue(all(r["share_pct"] is None for r in hours if r["gio_utc"] == 23))
+        sunday = [r for r in self.page("genre_by_weekday")["rows"] if r["thu_iso"] == 7]
+        self.assertEqual(next(r["share_pct"] for r in sunday if r["tag"] == "jazz"), 100)
+        expected_pair = [{"u1": "a", "u2": "b", "cosine": round(1 / math.sqrt(26), 3)}]
+        self.assertEqual(self.page("genre_similarity")["rows"], expected_pair)
+        self.assertEqual(self.page("genre_similarity", user_id="b", peer="a")["rows"], expected_pair)
+        self.assertEqual(self.page("genre_similarity", user_id="b", peer="c")["total"], 0)
+        self.assertEqual(self.page("genre_pairs")["rows"], [{"t1": "pop", "t2": "rock", "so_luot": 1}])
+        page = self.page("user_genre_top", user_id="a", limit=1, offset=1)
+        self.assertEqual((page["total"], page["next_offset"], page["rows"]), (2, None, ranked["rows"][1:]))
+
+    def test_genre_display_limits_do_not_truncate_profiles(self):
+        self.publish_tags([("a", 3600, [f"g{i:02}"]) for i in range(11)] + [("b", 0, ["g10"])])
+        self.assertEqual([r["tag"] for r in self.page("user_genre_top", user_id="a")["rows"]],
+                         [f"g{i:02}" for i in range(10)])
+        self.assertEqual(self.page("global_genre")["total"], 11)
+        self.assertAlmostEqual(self.page("genre_diversity", user_id="a")["rows"][0]["entropy"], math.log2(11))
+        self.assertEqual(self.page("genre_similarity")["rows"][0]["cosine"], round(1/math.sqrt(11), 3))
+        hours = self.page("genre_by_hour", limit=192)["rows"]
+        self.assertEqual(len(hours), 192)
+        one = [r for r in hours if r["gio_utc"] == 1]
+        self.assertEqual([r["tag"] for r in one], ["g10"] + [f"g{i:02}" for i in range(7)])
+        self.assertTrue(all(r["share_pct"] == 12.5 for r in one))
+        self.assertFalse(self.page("genre_pairs")["rows"])
+
+    def test_daily_export_serves_during_genre_migration_then_remains_pinned(self):
+        first = refresh(self.store)["run_id"]
+        old = self.store.manifest(first)
+        old.update(pipeline_version=2, tables={t: old["tables"][t] for t in DAILY_TABLES})
+        self.store.commit(old)
+        self.assertEqual(self.store.latest()["run_id"], first)
+        self.assertEqual(self.page("hour_distribution")["total"], 24)
+        self.assertEqual(refresh(self.store)["status"], "published")
+        self.assertEqual(self.store.latest()["pipeline_version"], 3)
+        self.assertEqual(self.page("weekday_hour_distribution", run_id=first)["total"], 168)
 
     def test_legacy_export_can_be_read_by_id_without_replacing_daily_results(self):
         published = refresh(self.store)["run_id"]

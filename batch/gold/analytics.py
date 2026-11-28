@@ -1,19 +1,26 @@
 """UTC listening patterns by hour, weekday and weekday/weekend."""
 from .catalog import TABLES
+from .genres import GENRE_QUERIES
 
 
 def prepare(db, dataset):
-    source = dataset.scanner(columns=["event_id", "user_id", "listened_at"]).to_reader()
+    columns = ["event_id", "user_id", "listened_at"]
+    # Older snapshots can have no tags column; their daily metrics still apply.
+    tags = "[]::VARCHAR[]"
+    if "tags" in dataset.schema.names:
+        columns.append("tags")
+        tags = "list_distinct(list_transform(list_filter(tags, t -> trim(t) <> ''), t -> lower(trim(t))))"
+    source = dataset.scanner(columns=columns).to_reader()
     db.register("silver", source)
-    db.execute("""
+    db.execute(f"""
         CREATE TABLE plays AS
         WITH events AS (
-            SELECT event_id, user_id AS "user",
+            SELECT event_id, user_id AS "user", {tags} AS tags,
                    CASE WHEN listened_at BETWEEN 0 AND 253402300799
                         THEN make_timestamp(listened_at * 1000000) END AS ts
             FROM silver
         )
-        SELECT event_id, "user", ts::DATE AS day, hour(ts)::INTEGER AS gio_utc,
+        SELECT event_id, "user", tags, ts::DATE AS day, hour(ts)::INTEGER AS gio_utc,
                isodow(ts)::INTEGER AS thu_iso, (isodow(ts) >= 6)::INTEGER AS cuoi_tuan
         FROM events
     """)
@@ -66,5 +73,6 @@ QUERIES = {
         SELECT count(*) AS so_user_so_sanh, round(100 * avg(1-share),2) AS pct_ngay_thuong,
                round(100 * avg(share),2) AS pct_cuoi_tuan FROM shares
     """,
+    **GENRE_QUERIES,
 }
 assert tuple(QUERIES) == TABLES

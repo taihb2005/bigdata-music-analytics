@@ -10,9 +10,10 @@ import duckdb
 from deltalake import DeltaTable
 
 from .analytics import QUERIES, prepare
+from .genres import prepare_genres
 
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 
 def refresh(store):
@@ -32,6 +33,7 @@ def refresh(store):
     with TemporaryDirectory(prefix="music-gold-") as scratch:
         with duckdb.connect(str(Path(scratch) / "analysis.duckdb")) as db:
             source["rows"] = prepare(db, delta.to_pyarrow_dataset())
+            source.update(prepare_genres(db))
             for name, query in QUERIES.items():
                 file = Path(scratch) / (name + ".parquet")
                 db.sql(query).write_parquet(str(file), compression="snappy", row_group_size=16384)

@@ -8,7 +8,7 @@ from io import BytesIO
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
 
-from .catalog import GoldCatalog
+from .catalog import DAILY_TABLES, GoldCatalog
 
 
 class GoldStore(GoldCatalog):
@@ -44,11 +44,40 @@ class GoldStore(GoldCatalog):
             obj.close()
             obj.release_conn()
 
-    def page(self, manifest, table, offset, limit):
+    def _user_page(self, run, table, user_id, peer, offset, limit):
+        import pyarrow.dataset as ds
+
+        if table == "genre_similarity":
+            if peer:
+                first, second = sorted((user_id, peer))
+                predicate = (ds.field("u1") == first) & (ds.field("u2") == second)
+            else:
+                predicate = (ds.field("u1") == user_id) | (ds.field("u2") == user_id)
+        else:
+            predicate = ds.field("user_id") == user_id
+        key = self.key(run, f"{table}/part-00000.parquet")
+        dataset = ds.dataset(f"{self.bucket}/{key}", filesystem=self.filesystem, format="parquet")
+        total = dataset.count_rows(filter=predicate)
+        rows = []
+        if offset < total:
+            for batch in dataset.to_batches(filter=predicate, batch_size=2048):
+                if offset >= batch.num_rows:
+                    offset -= batch.num_rows
+                    continue
+                rows.extend(batch.slice(offset, limit - len(rows)).to_pylist())
+                offset = 0
+                if len(rows) == limit:
+                    break
+        return total, rows
+
+    def page(self, manifest, table, offset, limit, *, user_id=None, peer=None):
         run = manifest["run_id"]
         total = manifest["tables"][table]["rows"]
         rows = []
-        if offset < total and manifest.get("pipeline_version") == 2:
+        small_tables = (*DAILY_TABLES, "genre_by_hour", "genre_by_weekday")
+        if user_id:
+            total, rows = self._user_page(run, table, user_id, peer, offset, limit)
+        elif offset < total and manifest.get("pipeline_version") in (2, 3) and table in small_tables:
             data = self._daily_table(run, table)
             if data.num_rows != total:
                 raise IOError("Published Gold table does not match its manifest")

@@ -53,7 +53,13 @@ class GoldReader:
             table = unquote(parts[2])
             if table not in manifest["tables"]:
                 raise ApiError(404, "Không có bảng này trong lần xuất Gold đã chọn")
-            return self.store.page(manifest, table, offset, limit)
+            user_id = query.get("user_id", [""])[0].strip()
+            peer = query.get("peer", [""])[0].strip()
+            if user_id and table not in ("user_genre_top", "genre_diversity", "genre_similarity"):
+                raise ApiError(400, "Bảng này không có bộ lọc user_id")
+            if peer and (not user_id or table != "genre_similarity" or peer == user_id):
+                raise ApiError(400, "Chọn hai user khác nhau trong bảng so sánh gu")
+            return self.store.page(manifest, table, offset, limit, user_id=user_id, peer=peer)
         except ApiError:
             raise
         except Exception as exc:

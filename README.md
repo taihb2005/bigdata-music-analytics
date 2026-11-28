@@ -104,6 +104,21 @@ $page = Invoke-RestMethod "http://localhost:8001/batch/gold/weekday_hour_distrib
 $page.rows
 ```
 
+### Thể loại ưa thích
+
+Chọn **Thể loại ưa thích** trên dashboard. Gold dùng `fact_listen.tags` của Silver (ưu tiên tag bài hát, sau đó dùng tag nghệ sĩ). Một lượt có ba tag hợp lệ đóng góp ⅓ lượt quy đổi cho mỗi tag. Dashboard hiển thị số lượt và số người có tag. Tỷ lệ thể loại của từng người dùng mẫu số là số lượt có tag của người đó. Các thống kê giờ và thứ ở màn hình chính vẫn tính toàn bộ lượt nghe.
+
+| Bảng sau `/batch/gold/` | Cách đọc |
+|---|---|
+| `user_genre_top` | Top 10 tag của từng người. `pct` là phần trăm trên toàn bộ gu của người đó. `so_luot` đếm sự kiện mang tag, `luot_quy_doi` chia trọng số cho các tag. |
+| `global_genre` | `share_pct_tb` là tỷ trọng trung bình trên tất cả người có tag, kể cả người có tỷ trọng 0 cho tag đang xét. Đọc cùng `so_user` để thấy có bao nhiêu người đóng góp. |
+| `genre_diversity` | Entropy Shannon cơ số 2 trên toàn bộ tag, kèm số tag và tỷ lệ tag đứng đầu (0–1). Entropy bằng 0 khi chỉ nghe một tag. |
+| `genre_by_hour`, `genre_by_weekday` | Tám tag đứng đầu toàn nhóm theo 24 giờ UTC hoặc bảy thứ UTC. Dashboard chuyển giữa lượt quy đổi và tỷ lệ trong tổng của tám tag ở từng hàng. Tỷ lệ để trống khi tổng hàng bằng 0. |
+| `genre_similarity` | Cosine trên toàn bộ phân bố tag. Mỗi cặp có tag chung xuất hiện một lần. Hai người đều có hồ sơ nhưng không có tag chung có cosine bằng 0 và được lược khỏi bảng. Các tag phổ biến có thể làm điểm cao. |
+| `genre_pairs` | Số sự kiện mang đồng thời hai tag khác nhau. Mỗi cạnh là một cặp tag không phân biệt thứ tự. |
+
+Dùng `?user_id=...` để lọc thứ hạng, độ đa dạng hoặc các cặp của một người. Với `genre_similarity`, thêm `&peer=...` để xem một cặp cụ thể. Tất cả các bảng hỗ trợ `run_id`, `offset` và `limit`. Worker tự xuất lại khi nâng từ Gold phiên bản 2 lên 3, kể cả khi Silver chưa đổi.
+
 Nếu muốn chạy API hoặc Dashboard trực tiếp bằng Python trên máy local:
 ```powershell
 pip install -r requirements/api.txt -r requirements/ui.txt

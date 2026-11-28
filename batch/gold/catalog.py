@@ -12,9 +12,11 @@ from minio import Minio
 from minio.error import S3Error
 
 
-TABLES = (
+DAILY_TABLES = (
     "hour_distribution", "weekday_distribution", "weekday_hour_distribution", "day_type_distribution", "day_comparison",
 )
+TABLES = DAILY_TABLES + ("user_genre_top", "global_genre", "genre_diversity", "genre_by_hour",
+                        "genre_by_weekday", "genre_similarity", "genre_pairs")
 LEGACY_TABLES = (
     "user_coverage", "hour_distribution", "weekday_distribution", "month_distribution",
     "day_type_distribution", "day_comparison", "listening_sessions", "weekly_trend", "hour_tags",
@@ -86,8 +88,10 @@ class GoldCatalog:
         finally:
             response.close()
             response.release_conn()
+        # Notebook exports may lack a version. A v3 run must contain all genre tables.
+        valid_sets = (set(TABLES),) if data.get("pipeline_version") == 3 else (set(DAILY_TABLES), set(LEGACY_TABLES))
         if (data.get("status") != "succeeded" or data.get("run_id") != run
-                or set(data.get("tables", {})) not in (set(TABLES), set(LEGACY_TABLES))):
+                or set(data.get("tables", {})) not in valid_sets):
             return None
         return data
 
@@ -100,11 +104,14 @@ class GoldCatalog:
             if exc.code in MISSING:
                 return None
             raise
+        previous_daily = None
         for run in sorted(runs, reverse=True):
             manifest = self.manifest(run)
             if manifest and set(manifest["tables"]) == set(TABLES):
                 return manifest
-        return None
+            if previous_daily is None and manifest and set(manifest["tables"]) == set(DAILY_TABLES):
+                previous_daily = manifest
+        return previous_daily
 
     def ensure_bucket(self):
         if not self.client.bucket_exists(self.bucket):
