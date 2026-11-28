@@ -1,6 +1,7 @@
 """Exercise the scheduled job's Delta -> Parquet contract and the real API reader."""
 import io
 import math
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import shutil
@@ -55,6 +56,7 @@ class DiskObjects:
 
 class BatchGoldTest(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, BATCH_ENGINE="legacy"))
         self.scratch = tempfile.TemporaryDirectory()
         self.addCleanup(self.scratch.cleanup)
         base = Path(self.scratch.name)

@@ -3,8 +3,6 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from functools import cached_property, lru_cache
-from io import BytesIO
-
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
 
@@ -34,15 +32,38 @@ class GoldStore(GoldCatalog):
             return {"path": f"s3a://{self.bucket}/{self.key(run, name)}", "rows": remote.metadata.num_rows,
                     "schema": {"type": "struct", "fields": fields}}
 
+    def put_dataset(self, run, name, directory, schema):
+        """Upload every Spark part, verify it, then let the caller publish the manifest."""
+        files = sorted(directory.glob("*.parquet"))
+        if not files:
+            raise IOError(f"Spark produced no Parquet files for {name}")
+        rows = 0
+        for file in files:
+            key = self.key(run, f"{name}/{file.name}")
+            expected = pq.ParquetFile(file)
+            self.client.fput_object(self.bucket, key, str(file))
+            with self.filesystem.open_input_file(f"{self.bucket}/{key}") as obj:
+                remote = pq.ParquetFile(obj)
+                if (remote.metadata.num_rows != expected.metadata.num_rows
+                        or remote.schema_arrow != expected.schema_arrow):
+                    raise IOError(f"Gold Parquet verification failed for {name}/{file.name}")
+                rows += remote.metadata.num_rows
+        return {"path": f"s3a://{self.bucket}/{self.key(run, name)}", "rows": rows, "schema": schema}
+
+    def _dataset(self, run, table):
+        import pyarrow.dataset as ds
+
+        prefix = self.key(run, table + "/")
+        paths = sorted(f"{self.bucket}/{obj.object_name}" for obj in
+                       self.client.list_objects(self.bucket, prefix=prefix, recursive=True)
+                       if obj.object_name.endswith(".parquet"))
+        if not paths:
+            raise IOError(f"Published Gold table has no Parquet files: {table}")
+        return ds.dataset(paths, filesystem=self.filesystem, format="parquet")
+
     @lru_cache(maxsize=32)
     def _daily_table(self, run, table):
-        # The daily worker writes one small part per table (at most 7 x 24 rows).
-        obj = self.client.get_object(self.bucket, self.key(run, f"{table}/part-00000.parquet"))
-        try:
-            return pq.read_table(BytesIO(obj.read()))
-        finally:
-            obj.close()
-            obj.release_conn()
+        return self._dataset(run, table).to_table()
 
     def _user_page(self, run, table, user_id, peer, offset, limit):
         import pyarrow.dataset as ds
@@ -55,8 +76,7 @@ class GoldStore(GoldCatalog):
                 predicate = (ds.field("u1") == user_id) | (ds.field("u2") == user_id)
         else:
             predicate = ds.field("user_id") == user_id
-        key = self.key(run, f"{table}/part-00000.parquet")
-        dataset = ds.dataset(f"{self.bucket}/{key}", filesystem=self.filesystem, format="parquet")
+        dataset = self._dataset(run, table)
         total = dataset.count_rows(filter=predicate)
         rows = []
         if offset < total:
@@ -77,7 +97,7 @@ class GoldStore(GoldCatalog):
         small_tables = (*DAILY_TABLES, "genre_by_hour", "genre_by_weekday")
         if user_id:
             total, rows = self._user_page(run, table, user_id, peer, offset, limit)
-        elif offset < total and manifest.get("pipeline_version") in (2, 3) and table in small_tables:
+        elif offset < total and manifest.get("pipeline_version") in (2, 3, 4) and table in small_tables:
             data = self._daily_table(run, table)
             if data.num_rows != total:
                 raise IOError("Published Gold table does not match its manifest")

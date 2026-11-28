@@ -6,7 +6,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
-import duckdb
 from deltalake import DeltaTable
 
 from .analytics import QUERIES, prepare
@@ -17,6 +16,16 @@ PIPELINE_VERSION = 3
 
 
 def refresh(store):
+    from .spark import engine
+    if engine() == "spark":
+        from .spark_job import refresh as spark_refresh
+        return spark_refresh(store)
+    return refresh_legacy(store)
+
+
+def refresh_legacy(store):
+    import duckdb
+
     cfg = store.settings
     started = datetime.now(timezone.utc)
     run = started.strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid4().hex[:8]

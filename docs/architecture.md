@@ -31,9 +31,9 @@ flowchart LR
 
     subgraph BATCH[Batch layer - nhóm batch]
         C[batch-consumer<br/>micro-batch theo partition] --> BR[(MinIO bucket bronze<br/>events/*.jsonl.gz)]
-        BR -.chưa có.-> SV[(Silver<br/>fact_listen, dim_*)]
-        SV -.chưa có.-> SB[Spark batch]
-        SB -.chưa có.-> BV[(Batch view)]
+        BR --> SV[(Silver Delta Lake<br/>delta-rs MERGE)]
+        SV --> SB[Spark SQL batch]
+        SB --> BV[(Gold Parquet<br/>MinIO)]
     end
 
     subgraph SPEED[Speed layer - nhóm speed]
@@ -64,7 +64,7 @@ Nét đứt là phần chưa làm hoặc phải sửa.
 | Kafka | chung | `docker/kafka.yml` | **Có.** Một broker cho cả project. |
 | Consumer Kafka → MinIO Bronze | batch | `batch/bronze/consumer/`, `batch/datalake/` | **Có.** Mục 2, bước 4. |
 | Silver | batch | `batch/silver/` | **Có.** Bronze → Silver trên Delta Lake. |
-| Spark batch, batch view | batch | — | **Chưa có.** Nhóm batch bổ sung mục 4.1. |
+| Gold | batch | `batch/gold/spark_job.py` | Spark SQL đọc Silver và xuất các bảng Gold dưới dạng Parquet. |
 | Spark speed layer, Redis, HBase | speed | `stream/processing/`, `stream/storage/`, `stream/common/bronze_event.py` | **Có.** Đọc `events.bronze.lastfm` và `events.demo.lastfm`. |
 | Metadata worker/sink của speed | speed | `stream/metadata/` | Có, nhưng message batch đã kèm metadata nên chỉ còn phục vụ event định dạng cũ. Có thể tắt. |
 | API serving | speed (tạm) | `stream/api/server.py` | Có. Mới đọc dữ liệu của speed. |
@@ -86,7 +86,7 @@ Nét đứt là phần chưa làm hoặc phải sửa.
    - Upload lên MinIO dưới dạng `.tmp`, rồi copy sang tên chính thức và xóa `.tmp`. **Chỉ sau đó** mới commit offset. Đây là at-least-once: có thể có bản ghi trùng, nên tầng Silver phải khử trùng theo `event_id`.
    - Đường dẫn object: `bronze/events/events_p{partition}_{offset_đầu}_{offset_cuối}_{unix_giây}.jsonl.gz`.
    - Message sai schema bị đưa vào DLQ. File `.tmp` bị bỏ dở quá 24 giờ thì tự dọn.
-5. **Batch, Silver và batch view:** chưa có (mục 4.1).
+5. Celery chạy tác vụ Silver ở phút 30 và ghi Delta bằng delta-rs. Worker Gold kiểm tra phiên bản Silver mỗi 900 giây và dùng Spark SQL xuất Parquet (mục 4.1).
 6. **Speed** (`stream/`):
    - Spark Structured Streaming đọc **cùng topic** với nhóm batch, cộng thêm `events.demo.lastfm`. Offset do checkpoint riêng quản lý (`spark-speed-layer-v5`), cứ 10 giây một micro-batch.
    - Username lấy từ `user_profile.name`. Thời lượng bài và tag lấy thẳng từ message, không gọi Last.fm.
@@ -184,19 +184,13 @@ Hàm ánh xạ là `to_fact_listen` trong `stream/common/fact_listen.py`, đã l
 
 ## 4. Batch view và realtime view
 
-### 4.1. Batch view (nhóm batch bổ sung)
+### 4.1. Batch Silver và Gold
 
-Tầng Silver đã có code ở `batch/silver/` (ghi Delta Lake), nhưng mục này chưa cập nhật theo code đó. Cần ghi rõ:
+Silver dùng delta-rs để ghi bảng Delta vào `SILVER_BASE_PATH` và `QUALITY_BASE_PATH`. Bảng `processed_files` theo dõi `(pipeline_version, source_uri, object_version)` để bỏ qua file đã hoàn tất.
 
-- **Silver:**
-  - Định dạng: Delta hay Iceberg (`docs/batch_pipeline.md` có nhắc cả hai).
-  - Bucket và đường dẫn trên MinIO.
-  - Cách phân vùng: đề xuất theo `listened_date`.
-  - Khử trùng theo `event_id`.
-- **Spark batch đọc Bronze thế nào.** Tên file Bronze chỉ có partition Kafka, offset và thời điểm ghi, **không** chia theo ngày. Nên mỗi lần chạy phải đọc lại toàn bộ, hoặc phải tự lưu danh sách file đã xử lý.
-- **Batch tính ra những gì:** ví dụ thống kê user theo ngày, top bài/nghệ sĩ/album, thói quen theo `dow`/`hour`, gợi ý dài hạn.
-- **Batch view lưu ở đâu:** đề xuất HBase, bảng riêng có tiền tố `batch_`. Kèm row key và các cột.
-- **Lịch chạy** của batch.
+Gold dùng Spark SQL đọc một phiên bản Delta cố định, xuất 5 bảng phân bố giờ/thứ/loại ngày và 7 bảng thể loại lên MinIO, mặc định `gold/batch_analysis/<run_id>/`. Manifest v4 được ghi sau cùng; API đọc cả các run v2/v3 cũ. Gold chạy mỗi `GOLD_INTERVAL_SECONDS` (mặc định 900), bỏ qua nếu phiên bản Silver chưa đổi.
+
+Worker Gold chạy Spark 3.5.6 với Delta 3.3.3, mặc định `local[2]`. [Hướng dẫn chạy Gold với Spark](spark_batch.md)
 
 ### 4.2. Realtime view (speed, đã có)
 
@@ -263,7 +257,7 @@ Còn lại:
 
 ### Nhóm batch
 
-- Silver, Spark batch và batch view (mục 4.1). Dùng chung `ids.py`.
+- Gold dùng Spark SQL để tổng hợp báo cáo từ Silver (mục 4.1).
 - Ghi mốc T theo mục 5.
 - Trả lời các vấn đề 3–7 ở mục 6. Sửa lệnh trong `docs/schemas.md`.
 

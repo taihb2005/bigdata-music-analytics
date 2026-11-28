@@ -2,10 +2,12 @@
 
 Hệ thống phân tích thói quen và xu hướng nghe nhạc từ Last.fm theo kiến trúc **Lambda** (kết hợp **Batch Layer** và **Speed Layer** với tầng **Serving** thống nhất). Kiến trúc chi tiết và hợp đồng dữ liệu: `docs/architecture.md`.
 
+Worker Gold dùng **Spark 3.5.6 + Delta 3.3.3** để đọc `fact_listen` và tổng hợp báo cáo. [Hướng dẫn chạy Gold với Spark](docs/spark_batch.md)
+
 ```text
 Last.fm ── producer batch (Celery, mỗi giờ) ──► Kafka events.bronze.lastfm ──► batch consumer → MinIO Bronze
                                                         │                                            │
-                       replay (dữ liệu giả) ──► Kafka events.demo.lastfm                     Silver (Delta Lake)
+                       replay ──► Kafka events.demo.lastfm                     Silver (Delta Lake)
                                                         │                                            │
                                 Spark Structured Streaming (đọc cả hai topic)                Gold (Parquet trên MinIO)
                                                         │  process_events()                          │
@@ -23,15 +25,10 @@ Last.fm ── producer batch (Celery, mỗi giờ) ──► Kafka events.bronz
 
 ## 1. Chuẩn bị môi trường
 
-Tất cả dịch vụ dùng chung **một file `.env` duy nhất** và **một entrypoint `docker-compose.yml` duy nhất** tại thư mục gốc:
-
 ```powershell
 Copy-Item .env.example .env
 # Điền LASTFM_API_KEY, REDIS_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, MINIO_ACCESS_KEY, MINIO_SECRET_KEY
 ```
-
-* Mặc định `HOST_BIND_IP=127.0.0.1` khóa toàn bộ các cổng ở `localhost` để an toàn khi dùng mạng công cộng. Khi cần mở Dashboard (`8501`) hoặc API (`8001`) ra mạng LAN, đổi `HOST_BIND_IP=0.0.0.0` trong `.env`.
-* Khi bật cả hệ thống (`--profile all`) hoặc luồng Stream (`--profile stream`), máy cần khoảng **8 GB RAM trống** cho Docker (HBase giới hạn `2g`, Spark `3g`, Redis `700m`). Chạy riêng tầng Gold chỉ tốn vài trăm MB RAM.
 
 | Dịch vụ | Biến cổng (`.env`) | Mặc định trên Host | Phạm vi lắng nghe |
 | :--- | :--- | :--- | :--- |
@@ -44,11 +41,11 @@ Copy-Item .env.example .env
 
 ---
 
-## 2. Khởi động bằng Docker Compose (theo Profile)
+## 2. Khởi động bằng Docker Compose
 
 `docker-compose.yml` gốc nạp các file con trong `docker/compose/` (`infra.yml`, `batch.yml`, `stream.yml`, `serving.yml`) và chia rõ theo `--profile`:
 
-### A. Chỉ bật tầng Gold + Dashboard (nhẹ, không bật Kafka / HBase / Spark)
+### A. Chỉ bật tầng Gold Spark + Dashboard (không bật Kafka / HBase)
 Khi đã có dữ liệu Silver (trên MinIO hoặc tại `data/delta/silver/fact_listen`):
 ```powershell
 docker compose --profile gold up -d --build
@@ -117,7 +114,7 @@ Chọn **Thể loại ưa thích** trên dashboard. Gold dùng `fact_listen.tags
 | `genre_similarity` | Cosine trên toàn bộ phân bố tag. Mỗi cặp có tag chung xuất hiện một lần. Hai người đều có hồ sơ nhưng không có tag chung có cosine bằng 0 và được lược khỏi bảng. Các tag phổ biến có thể làm điểm cao. |
 | `genre_pairs` | Số sự kiện mang đồng thời hai tag khác nhau. Mỗi cạnh là một cặp tag không phân biệt thứ tự. |
 
-Dùng `?user_id=...` để lọc thứ hạng, độ đa dạng hoặc các cặp của một người. Với `genre_similarity`, thêm `&peer=...` để xem một cặp cụ thể. Tất cả các bảng hỗ trợ `run_id`, `offset` và `limit`. Worker tự xuất lại khi nâng từ Gold phiên bản 2 lên 3, kể cả khi Silver chưa đổi.
+Dùng `?user_id=...` để lọc thứ hạng, độ đa dạng hoặc các cặp của một người. Với `genre_similarity`, thêm `&peer=...` để xem một cặp cụ thể. Tất cả các bảng hỗ trợ `run_id`, `offset` và `limit`. Lần đầu chuyển từ DuckDB (Gold v3) sang Spark, worker xuất bản Gold v4 từ phiên bản Silver hiện có.
 
 Nếu muốn chạy API hoặc Dashboard trực tiếp bằng Python trên máy local:
 ```powershell
@@ -132,7 +129,7 @@ python -m streamlit run ui/app.py
 
 ```text
 common/              Hợp đồng dữ liệu dùng chung: ids, bronze_event, fact_listen, nạp .env (env.py)
-batch/               Pipeline Batch: bronze (producer, consumer), silver (Delta Lake), gold (DuckDB/Parquet),
+batch/               Pipeline Batch: bronze (producer, consumer), silver (Delta Lake), gold (Spark/Parquet),
                      datalake (MinIO client), scheduler (Celery Beat & Worker)
 stream/              Pipeline Speed: processing (Spark & lõi pipeline), storage (Redis, HBase),
                      producer (replay & legacy), metadata (legacy), bootstrap, tools

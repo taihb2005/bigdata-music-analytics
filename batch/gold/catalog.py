@@ -88,8 +88,8 @@ class GoldCatalog:
         finally:
             response.close()
             response.release_conn()
-        # Notebook exports may lack a version. A v3 run must contain all genre tables.
-        valid_sets = (set(TABLES),) if data.get("pipeline_version") == 3 else (set(DAILY_TABLES), set(LEGACY_TABLES))
+        # v4 is Spark; v3 is DuckDB. Both publish the same complete table contract.
+        valid_sets = (set(TABLES),) if data.get("pipeline_version") in (3, 4) else (set(DAILY_TABLES), set(LEGACY_TABLES))
         if (data.get("status") != "succeeded" or data.get("run_id") != run
                 or set(data.get("tables", {})) not in valid_sets):
             return None
